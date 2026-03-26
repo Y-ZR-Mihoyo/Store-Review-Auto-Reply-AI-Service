@@ -337,7 +337,7 @@ def _build_result(
     """Build standardized result dictionary."""
     result = {
         "event_id": event_id,
-        "order_id": order_id,
+        "order_id": str(order_id),
         "action": action,
     }
     
