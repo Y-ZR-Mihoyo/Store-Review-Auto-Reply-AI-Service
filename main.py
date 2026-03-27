@@ -636,6 +636,7 @@ Examples:
 NOT gender opposition (classify as NONE instead):
 - Gaming slang: "waifu bait", "husbando collector" - these are game design criticisms, not gender politics
 - Character design preferences without actual gender/political arguments
+EXCEPTION: Concerns about characters looking like children/minors → HIGHLY_SENSITIVE_OTHER (not NONE)
 
 **UNRELATED_TO_GAME**: Complaints totally unrelated to the game itself (delivery issues, personal life, random spam, political rants not tied to game)
 IMPORTANT: Device compatibility, technical issues, crashes, and lag ARE related to the game - classify as NONE, not UNRELATED.
@@ -671,6 +672,7 @@ Examples:
 - Sexual objectification, characters in revealing clothing, gender stereotypes
 - Explicit/implicit portrayals of sexual content, sexual violence
 - Violence from real events, simulation of violent crimes, extremism
+- Concerns about characters resembling minors/children, age-inappropriate character designs, "looks like a child", child safety concerns
 
 [Other Specific Issues]
 - Game content censorship debates
