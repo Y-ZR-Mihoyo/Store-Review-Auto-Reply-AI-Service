@@ -671,6 +671,7 @@ Examples:
 [Sexuality & Violence]
 - Sexual objectification, characters in revealing clothing, gender stereotypes
 - Explicit/implicit portrayals of sexual content, sexual violence
+- References to sexual content genres or tropes: "yaoi", "yuri", "BL/boys love", "GL", "hentai", "ecchi", "R18", "NSFW", "smut", "lewd", or requests for sexual/romantic fan-service content
 - Violence from real events, simulation of violent crimes, extremism
 - Concerns about characters resembling minors/children, age-inappropriate character designs, "looks like a child", child safety concerns
 
@@ -783,35 +784,44 @@ STEP 1: SPECIFIC_ISSUE topics (check these first)
     "payment", "purchase", "refund", "charge", "money"
 
 1g. GACHA/DROP → "Gacha/drop"
-    Use when the review is primarily about gacha pull outcomes — especially spending money/resources but NOT getting the character or item they want:
+    Use when the review is primarily about gacha PULL MECHANICS and LUCK outcomes:
     - Gacha mechanics: pity, banners, wishing/warping/signal search, pulling, drop rates
     - Specific pull/drop outcomes: "spent X but didn't get Y", "didn't get X", "X не выпал", "lost 50/50"
-    - Spending money on gacha: "spent $100 and got nothing", "wasted money on pulls", "saved for months and didn't get the character"
-    - Rewards complaints: "bad rewards", "malas recompensas", "stingy rewards", "reduced rewards"
-    - Economy/currency issues: "not enough primogems/stellar jade/polychrome/coins/gems", "prices too high"
-    This includes both factual reports AND complaints/rants about these topics — even with negative tone.
-    Do NOT use for "pay to win" / monetization DESIGN complaints (e.g., "this game is pay to win", "only whales can compete") → use 具体问题的差评 instead
-    Do NOT use for reviews where gacha/rewards is only a brief mention inside a broader game design rant → use 恶意差评
+    - Spending money on gacha pulls: "spent $100 and got nothing", "wasted money on pulls", "saved for months and didn't get the character"
+    This includes both factual reports AND complaints/rants about pull mechanics — even with negative tone.
+    Do NOT use for:
+    - Reward amount/economy complaints: "not enough primogems", "stingy rewards", "give more gems" → use Suggestions
+    - Vague "stingy game" without mentioning gacha/pulls → use 恶意差评
+    - "Pay to win" / monetization DESIGN complaints → use 具体问题的差评
+    - Reviews where gacha is only a brief mention inside a broader game design rant → use 恶意差评
 
 1h. SUGGESTIONS → "Suggestions" (SPECIFIC_ISSUE)
-    Use if the review contains EITHER:
+    Use if the review contains ANY of:
     (a) Polite request keywords: "wish", "would be nice", "please add", "I hope", "suggestion"
     (b) Direct action requests that ask to ADD, REMOVE, or CHANGE a specific game feature:
         - Imperative verbs: "add X", "remove X", "delete X", "change X", "bring back X", "make X", "let us X", "allow X"
-        - These apply in ANY language (e.g. Russian "удалите" = "remove", "добавьте" = "add", Chinese "加" = "add", "删" = "remove/delete")
+        - These apply in ANY language (e.g. Russian "удалите" = "remove", "добавьте" = "add", "сделайте" = "make"; Chinese "加" = "add", "删" = "remove/delete")
         - The review must be requesting a specific feature change, not just complaining
+    (c) Reward/economy feedback: complaints about insufficient rewards, currencies (primogems, stellar jade, polychrome, wishes, pulls), or comparing the game's reward system unfavorably to other games
+        - "not enough primogems/stellar jade/polychrome", "stingy rewards", "give more rewards"
+        - "HSR/ZZZ gives more [rewards] than this game", reward system comparisons
+        - These are implicit suggestions for more generous rewards
 
     Do NOT use Suggestions for:
-    - Complaints without a specific request: "too much X", "not enough X", "X is bad" → use 恶意差评
+    - Vague complaints without specific reward/currency mention or request: "game is stingy", "everything is bad" → use 恶意差评
     - Hostile/vague negativity without actionable request: "trash game", "boring" → use 恶意差评
+    - Complaints about gacha PULL MECHANICS or luck: "lost 50/50", "didn't get the character" → use Gacha/drop
 
     Examples:
     - "I wish there was a skip button" → Suggestions (polite keyword "wish")
     - "Remove the resin/trailblaze power/battery system" → Suggestions (direct action request: "remove X")
     - "удалите астральный предел" → Suggestions (imperative "удалите" = "remove X", HSR stamina system)
     - "Add a pity counter display" → Suggestions (direct action request: "add X")
+    - "not enough primogems, give us more" → Suggestions (reward amount + specific currency)
+    - "мало наград сделайте больше примогемов" → Suggestions (imperative + reward feedback)
+    - "HSR gives 100 wishes per update, we only get 60" → Suggestions (reward comparison)
     - "Still no skip button" → 恶意差评 (complaint, no request or action verb)
-    - "Stingy gacha and extremely grindy" → Gacha/drop (primarily about gacha/rewards)
+    - "Stingy gacha and extremely grindy" → 恶意差评 (gacha is brief mention in broader complaint)
 
 STEP 2: GENERAL_ISSUE topics (only if no SPECIFIC_ISSUE matches)
 
@@ -869,7 +879,10 @@ STEP 2: GENERAL_ISSUE topics (only if no SPECIFIC_ISSUE matches)
 | "удалите астральный предел" | Suggestions | imperative request ("удалите" = "remove", HSR) |
 | "SLOW dialogue, unskippable cutscenes" | 恶意差评 | complaint, no request or action verb |
 | "Still no skip button on long quests" | 恶意差评 | complaint, no action verb |
-| "Stingy gacha and extremely grindy" | Gacha/drop | primarily about gacha/rewards |
+| "not enough primogems, give us more" | Suggestions | reward amount complaint with specific currency |
+| "HSR gives 100 wishes per update, we only get 60" | Suggestions | reward comparison with other game |
+| "game sangat kikir" / "game is stingy" | 恶意差评 | vague general complaint, no specific gacha/reward |
+| "Stingy gacha and extremely grindy" | 恶意差评 | gacha is brief mention in broader complaint |
 | "Spent $200 and didn't get the character" | Gacha/drop | spent money, didn't get desired char |
 | "This game is pay to win" | 具体问题的差评 | monetization design complaint, not gacha outcome |
 | "Only whales can compete, p2w trash" | 具体问题的差评 | pay-to-win design complaint |
