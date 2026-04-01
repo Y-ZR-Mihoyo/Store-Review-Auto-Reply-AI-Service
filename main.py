@@ -164,6 +164,10 @@ EWMA_MIN_DAYS_OPTIMIZE = 90
 EWMA_TRAIN_RATIO = 0.70
 VALID_GAMES = {"GI", "HSR", "ZZZ"}
 
+# Report config
+REPORT_CACHE_COLLECTION = "report_cache"
+REPORT_CACHE_TTL_HOURS = 4
+
 
 def _log_event(msg: str, data: Dict[str, Any]) -> None:
     logging.info(_json_dumps({"msg": msg, **data}))
@@ -457,6 +461,7 @@ def _gen_json(
     max_tokens: int = 1024,
     response_schema: Optional[Dict[str, Any]] = None,
     retries: int = 0,
+    temperature: float = 0,
 ) -> Dict[str, Any]:
     client = _get_genai_client()
 
@@ -478,7 +483,7 @@ def _gen_json(
 
         try:
             cfg_obj = types.GenerateContentConfig(
-                temperature=0,
+                temperature=temperature,
                 top_p=1,
                 max_output_tokens=max_tokens,
                 response_mime_type="application/json",
@@ -487,7 +492,7 @@ def _gen_json(
             cfg_to_use: Any = cfg_obj
         except Exception:
             cfg_dict: Dict[str, Any] = {
-                "temperature": 0,
+                "temperature": temperature,
                 "top_p": 1,
                 "max_output_tokens": max_tokens,
                 "response_mime_type": "application/json",
@@ -1435,6 +1440,387 @@ def _fs_query_reviews_by_topic(
     return results
 
 
+# -----------------------------
+# Report: date range query + metrics aggregation
+# -----------------------------
+
+def _compute_period_ranges(
+    period_type: str, date_str: str
+) -> Tuple[str, str, str, str, str, str]:
+    """Compute (current_start, current_end, prior_start, prior_end, label, prior_label)."""
+    if period_type == "weekly":
+        d = datetime.date.fromisoformat(date_str[:10])
+        monday = d - datetime.timedelta(days=d.weekday())
+        sunday = monday + datetime.timedelta(days=6)
+        current_start = f"{monday}T00:00:00Z"
+        current_end = f"{sunday + datetime.timedelta(days=1)}T00:00:00Z"
+        prior_monday = monday - datetime.timedelta(days=7)
+        prior_sunday = prior_monday + datetime.timedelta(days=6)
+        prior_start = f"{prior_monday}T00:00:00Z"
+        prior_end = f"{prior_sunday + datetime.timedelta(days=1)}T00:00:00Z"
+        iso_cal = monday.isocalendar()
+        label = f"{iso_cal[0]}-W{iso_cal[1]:02d}"
+        prior_cal = prior_monday.isocalendar()
+        prior_label = f"{prior_cal[0]}-W{prior_cal[1]:02d}"
+    elif period_type == "monthly":
+        parts = date_str.split("-")
+        year, month = int(parts[0]), int(parts[1])
+        first_day = datetime.date(year, month, 1)
+        if month == 12:
+            next_month_first = datetime.date(year + 1, 1, 1)
+        else:
+            next_month_first = datetime.date(year, month + 1, 1)
+        current_start = f"{first_day}T00:00:00Z"
+        current_end = f"{next_month_first}T00:00:00Z"
+        if month == 1:
+            prior_first = datetime.date(year - 1, 12, 1)
+        else:
+            prior_first = datetime.date(year, month - 1, 1)
+        prior_start = f"{prior_first}T00:00:00Z"
+        prior_end = f"{first_day}T00:00:00Z"
+        label = f"{year}-{month:02d}"
+        prior_label = f"{prior_first.year}-{prior_first.month:02d}"
+    else:
+        raise ValueError(f"Invalid period_type: {period_type}")
+    return current_start, current_end, prior_start, prior_end, label, prior_label
+
+
+def _fs_query_events_by_date_range(
+    start_iso: str, end_iso: str
+) -> List[Dict[str, Any]]:
+    """Query review_events by ingested_at date range. Returns all real CSC events."""
+    if not FIRESTORE_ENABLED:
+        return []
+    _, project = _fs_init_auth()
+    token = _fs_get_token()
+    base = f"https://firestore.googleapis.com/v1/projects/{project}/databases/{FIRESTORE_DATABASE}/documents"
+    url = f"{base}:runQuery"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json; charset=utf-8",
+    }
+
+    all_results: List[Dict[str, Any]] = []
+    cursor_start = start_iso
+    page_limit = 5000
+
+    while True:
+        field_filters = [
+            {"fieldFilter": {"field": {"fieldPath": "ingested_at"}, "op": "GREATER_THAN_OR_EQUAL", "value": {"stringValue": cursor_start}}},
+            {"fieldFilter": {"field": {"fieldPath": "ingested_at"}, "op": "LESS_THAN", "value": {"stringValue": end_iso}}},
+        ]
+        query_body = {
+            "structuredQuery": {
+                "from": [{"collectionId": FIRESTORE_COLLECTION}],
+                "where": {"compositeFilter": {"op": "AND", "filters": field_filters}},
+                "orderBy": [{"field": {"fieldPath": "ingested_at"}, "direction": "ASCENDING"}],
+                "limit": page_limit,
+            }
+        }
+        resp = _HTTP.post(url, headers=headers, data=json.dumps(query_body), timeout=30)
+        resp.raise_for_status()
+
+        page_results = []
+        for item in resp.json():
+            doc = item.get("document")
+            if not doc:
+                continue
+            fields = doc.get("fields", {})
+            parsed = {k: _fs_parse_value(v) for k, v in fields.items()}
+            eid = parsed.get("event_id") or ""
+            if not eid.startswith("evt_gp_"):
+                continue
+            page_results.append(parsed)
+
+        all_results.extend(page_results)
+
+        if len(page_results) < page_limit:
+            break
+        last_ts = page_results[-1].get("ingested_at") or ""
+        if not last_ts or last_ts <= cursor_start:
+            break
+        cursor_start = last_ts
+
+    return all_results
+
+
+def _kpi(current_val, prior_val):
+    """Build a KPI dict with value, delta, delta_pct."""
+    delta = None if prior_val is None else round(current_val - prior_val, 2)
+    delta_pct = None
+    if prior_val is not None and prior_val != 0:
+        delta_pct = round((current_val - prior_val) / prior_val * 100, 1)
+    return {"value": round(current_val, 2), "delta": delta, "delta_pct": delta_pct}
+
+
+def _safe_pct(numerator, denominator):
+    return round(numerator / denominator * 100, 1) if denominator else 0.0
+
+
+def _safe_mean(values):
+    return round(sum(values) / len(values), 2) if values else 0.0
+
+
+def _topic_trend(current_count, prior_count, delta_pct):
+    if prior_count == 0 and current_count > 0:
+        return "new"
+    if delta_pct is not None and delta_pct > 20:
+        return "rising"
+    if delta_pct is not None and delta_pct < -20:
+        return "declining"
+    return "stable"
+
+
+def _aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Single-pass aggregation of a list of review events."""
+    total = len(events)
+    low_star = 0
+    action_counts: Dict[str, int] = {}
+    game_events: Dict[str, List[Dict[str, Any]]] = {"GI": [], "HSR": [], "ZZZ": []}
+    topic_counts: Dict[str, int] = {}
+    topic_game_counts: Dict[str, Dict[str, int]] = {}
+    stage1_counts: Dict[str, int] = {}
+    template_counts: Dict[str, int] = {}
+    language_counts: Dict[str, int] = {}
+    confidences: List[float] = []
+    latencies: List[int] = []
+    daily_volume: Dict[str, Dict[str, Any]] = {}
+
+    for ev in events:
+        rating = ev.get("rating")
+        if isinstance(rating, int) and rating <= 2:
+            low_star += 1
+
+        action = ev.get("action") or "UNKNOWN"
+        action_counts[action] = action_counts.get(action, 0) + 1
+
+        game = ev.get("game") or ""
+        if game in game_events:
+            game_events[game].append(ev)
+
+        topic = ev.get("stage2_topic") or ""
+        if topic:
+            topic_counts[topic] = topic_counts.get(topic, 0) + 1
+            if topic not in topic_game_counts:
+                topic_game_counts[topic] = {}
+            topic_game_counts[topic][game] = topic_game_counts[topic].get(game, 0) + 1
+
+        bucket = ev.get("stage1_bucket") or ""
+        if bucket:
+            stage1_counts[bucket] = stage1_counts.get(bucket, 0) + 1
+
+        tmpl = ev.get("template_id") or ""
+        if tmpl:
+            template_counts[tmpl] = template_counts.get(tmpl, 0) + 1
+
+        lang = ev.get("language") or ""
+        if lang:
+            language_counts[lang] = language_counts.get(lang, 0) + 1
+
+        conf = ev.get("stage2_confidence")
+        if isinstance(conf, (int, float)):
+            confidences.append(float(conf))
+
+        lat = ev.get("latency_ms")
+        if isinstance(lat, int):
+            latencies.append(lat)
+
+        ts = ev.get("ingested_at") or ""
+        date_key = ts[:10] if len(ts) >= 10 else ""
+        if date_key:
+            if date_key not in daily_volume:
+                daily_volume[date_key] = {"total": 0, "low_star": 0, "by_rating": {}, "by_game": {}}
+            dv = daily_volume[date_key]
+            dv["total"] += 1
+            if isinstance(rating, int) and rating <= 2:
+                dv["low_star"] += 1
+            r_str = str(rating) if isinstance(rating, int) else "?"
+            dv["by_rating"][r_str] = dv["by_rating"].get(r_str, 0) + 1
+            dv["by_game"][game] = dv["by_game"].get(game, 0) + 1
+
+    reply_count = action_counts.get("REPLY_AND_CLOSE", 0)
+    auto_reply_rate = _safe_pct(reply_count, low_star) if low_star else 0.0
+
+    return {
+        "total": total,
+        "low_star": low_star,
+        "low_star_pct": _safe_pct(low_star, total),
+        "auto_reply_count": reply_count,
+        "auto_reply_rate": auto_reply_rate,
+        "needs_human": action_counts.get("NEEDS_HUMAN", 0),
+        "avg_confidence": _safe_mean(confidences),
+        "avg_latency_ms": _safe_mean(latencies),
+        "action_counts": action_counts,
+        "game_events": game_events,
+        "topic_counts": topic_counts,
+        "topic_game_counts": topic_game_counts,
+        "stage1_counts": stage1_counts,
+        "template_counts": template_counts,
+        "language_counts": language_counts,
+        "daily_volume": daily_volume,
+    }
+
+
+def _compute_report_metrics(
+    current_events: List[Dict[str, Any]],
+    prior_events: List[Dict[str, Any]],
+    period_type: str,
+    label: str,
+    prior_label: str,
+) -> Dict[str, Any]:
+    """Compute full report metrics from current and prior period events."""
+    cur = _aggregate_events(current_events)
+    pri = _aggregate_events(prior_events) if prior_events else None
+
+    def _kpi_pair(cur_val, pri_val):
+        return _kpi(cur_val, pri_val if pri else None)
+
+    # --- Overview KPIs ---
+    overview = {
+        "total_reviews": _kpi_pair(cur["total"], pri["total"] if pri else None),
+        "low_star_count": _kpi_pair(cur["low_star"], pri["low_star"] if pri else None),
+        "low_star_pct": _kpi_pair(cur["low_star_pct"], pri["low_star_pct"] if pri else None),
+        "auto_reply_count": _kpi_pair(cur["auto_reply_count"], pri["auto_reply_count"] if pri else None),
+        "auto_reply_rate": _kpi_pair(cur["auto_reply_rate"], pri["auto_reply_rate"] if pri else None),
+        "needs_human_count": _kpi_pair(cur["needs_human"], pri["needs_human"] if pri else None),
+        "avg_confidence": _kpi_pair(cur["avg_confidence"], pri["avg_confidence"] if pri else None),
+        "avg_latency_ms": _kpi_pair(cur["avg_latency_ms"], pri["avg_latency_ms"] if pri else None),
+    }
+
+    # --- Per-game breakdown ---
+    per_game = []
+    for game in ("GI", "HSR", "ZZZ"):
+        g_cur = _aggregate_events(cur["game_events"].get(game, []))
+        g_pri = _aggregate_events(pri["game_events"].get(game, [])) if pri else None
+
+        # Top 5 topics for this game
+        g_topic_counts = g_cur["topic_counts"]
+        g_prior_topic_counts = g_pri["topic_counts"] if g_pri else {}
+        sorted_topics = sorted(g_topic_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+        g_total = g_cur["total"] or 1
+        top_topics = []
+        for topic, count in sorted_topics:
+            p_count = g_prior_topic_counts.get(topic, 0)
+            share = _safe_pct(count, g_total)
+            d_pct = round((count - p_count) / p_count * 100, 1) if p_count else None
+            top_topics.append({
+                "topic": topic, "count": count, "share_pct": share,
+                "delta": count - p_count, "delta_pct": d_pct,
+                "trend": _topic_trend(count, p_count, d_pct),
+            })
+
+        # Daily volume
+        daily = []
+        for date_key in sorted(g_cur["daily_volume"]):
+            dv = g_cur["daily_volume"][date_key]
+            daily.append({"date": date_key, "total": dv["total"], "low_star": dv["low_star"], "by_rating": dv["by_rating"]})
+
+        per_game.append({
+            "game": game,
+            "kpis": {
+                "total_reviews": _kpi(g_cur["total"], g_pri["total"] if g_pri else None),
+                "auto_reply_rate": _kpi(g_cur["auto_reply_rate"], g_pri["auto_reply_rate"] if g_pri else None),
+                "low_star_pct": _kpi(g_cur["low_star_pct"], g_pri["low_star_pct"] if g_pri else None),
+            },
+            "top_topics": top_topics,
+            "daily_volume": daily,
+        })
+
+    # --- Topic intelligence ---
+    all_topic_counts = cur["topic_counts"]
+    all_prior_topic_counts = pri["topic_counts"] if pri else {}
+    sorted_all_topics = sorted(all_topic_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+    all_total = cur["total"] or 1
+
+    top_topics_list = []
+    emerging = []
+    declining = []
+    for rank, (topic, count) in enumerate(sorted_all_topics, 1):
+        p_count = all_prior_topic_counts.get(topic, 0)
+        share = _safe_pct(count, all_total)
+        d_pct = round((count - p_count) / p_count * 100, 1) if p_count else None
+        trend = _topic_trend(count, p_count, d_pct)
+        game_dist = cur["topic_game_counts"].get(topic, {})
+        entry = {
+            "rank": rank, "topic": topic, "count": count, "share_pct": share,
+            "game_distribution": {"GI": game_dist.get("GI", 0), "HSR": game_dist.get("HSR", 0), "ZZZ": game_dist.get("ZZZ", 0)},
+            "prior_count": p_count, "delta": count - p_count, "delta_pct": d_pct, "trend": trend,
+        }
+        top_topics_list.append(entry)
+        if trend == "new" or (d_pct is not None and d_pct > 50):
+            emerging.append({"topic": topic, "count": count, "prior_count": p_count, "delta_pct": d_pct})
+        if d_pct is not None and d_pct < -30:
+            declining.append({"topic": topic, "count": count, "prior_count": p_count, "delta_pct": d_pct})
+
+    topic_intelligence = {"top_topics": top_topics_list, "emerging": emerging, "declining": declining}
+
+    # --- Pipeline health ---
+    # Action distribution
+    action_dist = []
+    act_total = cur["total"] or 1
+    for action in ("REPLY_AND_CLOSE", "TAG_AND_CLOSE", "NEEDS_HUMAN", "NOOP"):
+        c = cur["action_counts"].get(action, 0)
+        action_dist.append({"action": action, "count": c, "pct": _safe_pct(c, act_total)})
+
+    # Stage 1 distribution
+    stage1_dist = sorted(
+        [{"bucket": b, "count": c, "pct": _safe_pct(c, act_total)} for b, c in cur["stage1_counts"].items()],
+        key=lambda x: x["count"], reverse=True,
+    )
+
+    # Confidence histogram
+    conf_buckets = {"0-0.5": 0, "0.5-0.7": 0, "0.7-0.8": 0, "0.8-0.9": 0, "0.9-1.0": 0}
+    for ev in current_events:
+        conf = ev.get("stage2_confidence")
+        if not isinstance(conf, (int, float)):
+            continue
+        c = float(conf)
+        if c < 0.5:
+            conf_buckets["0-0.5"] += 1
+        elif c < 0.7:
+            conf_buckets["0.5-0.7"] += 1
+        elif c < 0.8:
+            conf_buckets["0.7-0.8"] += 1
+        elif c < 0.9:
+            conf_buckets["0.8-0.9"] += 1
+        else:
+            conf_buckets["0.9-1.0"] += 1
+    conf_total = sum(conf_buckets.values()) or 1
+    conf_hist = [{"range": r, "count": c, "pct": _safe_pct(c, conf_total)} for r, c in conf_buckets.items()]
+
+    # Template usage (top 10)
+    tmpl_sorted = sorted(cur["template_counts"].items(), key=lambda x: x[1], reverse=True)[:10]
+    tmpl_total = sum(cur["template_counts"].values()) or 1
+    template_usage = [{"template_id": t, "count": c, "pct": _safe_pct(c, tmpl_total)} for t, c in tmpl_sorted]
+
+    # Language coverage
+    lang_sorted = sorted(cur["language_counts"].items(), key=lambda x: x[1], reverse=True)
+    lang_total = sum(cur["language_counts"].values()) or 1
+    language_coverage = [{"language": l, "count": c, "pct": _safe_pct(c, lang_total)} for l, c in lang_sorted]
+
+    # Daily volume (all games combined)
+    daily_all = []
+    for date_key in sorted(cur["daily_volume"]):
+        dv = cur["daily_volume"][date_key]
+        daily_all.append({"date": date_key, "total": dv["total"], "low_star": dv["low_star"], "by_rating": dv["by_rating"], "by_game": dv["by_game"]})
+
+    pipeline_health = {
+        "action_distribution": action_dist,
+        "stage1_distribution": stage1_dist,
+        "confidence_histogram": conf_hist,
+        "template_usage": template_usage,
+        "language_coverage": language_coverage,
+    }
+
+    return {
+        "overview": overview,
+        "per_game": per_game,
+        "topic_intelligence": topic_intelligence,
+        "pipeline_health": pipeline_health,
+        "daily_volume": daily_all,
+    }
+
+
 def _build_topic_analysis_prompt(topic: str, reviews: List[Dict[str, Any]]) -> str:
     review_lines = []
     for i, r in enumerate(reviews, 1):
@@ -2027,6 +2413,286 @@ def _handle_ewma_opt_history(request):
 
 
 # -----------------------------
+# Report: AI narrative + endpoint + caching
+# -----------------------------
+
+REPORT_NARRATIVE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "executive_summary": {"type": "STRING"},
+        "topic_insight": {"type": "STRING"},
+        "pipeline_note": {"type": "STRING"},
+    },
+    "required": ["executive_summary", "topic_insight", "pipeline_note"],
+}
+
+_NARRATIVE_FALLBACK = {
+    "executive_summary": "AI summary unavailable for this period.",
+    "topic_insight": "AI summary unavailable for this period.",
+    "pipeline_note": "AI summary unavailable for this period.",
+}
+
+
+def _generate_report_narrative(
+    metrics: Dict[str, Any], period_type: str, label: str
+) -> Dict[str, str]:
+    """Generate AI narrative summaries for the report using Gemini 2.0 Flash."""
+    try:
+        ov = metrics.get("overview", {})
+        ti = metrics.get("topic_intelligence", {})
+        ph = metrics.get("pipeline_health", {})
+        pg = metrics.get("per_game", [])
+
+        period_word = "week" if period_type == "weekly" else "month"
+        cmp_word = "WoW" if period_type == "weekly" else "MoM"
+
+        data_summary = (
+            f"Period: {label} ({period_type})\n"
+            f"Total reviews: {ov.get('total_reviews', {}).get('value', 0)} "
+            f"(delta: {ov.get('total_reviews', {}).get('delta', 'N/A')} {cmp_word})\n"
+            f"Low-star (1-2) count: {ov.get('low_star_count', {}).get('value', 0)}\n"
+            f"Auto-reply rate: {ov.get('auto_reply_rate', {}).get('value', 0)}% "
+            f"(delta: {ov.get('auto_reply_rate', {}).get('delta', 'N/A')})\n"
+            f"Needs-human count: {ov.get('needs_human_count', {}).get('value', 0)}\n"
+            f"Avg confidence: {ov.get('avg_confidence', {}).get('value', 0)}\n"
+            f"Avg latency: {ov.get('avg_latency_ms', {}).get('value', 0)}ms\n"
+        )
+
+        # Per-game summary
+        for g in pg:
+            gk = g.get("kpis", {})
+            data_summary += (
+                f"\n{g.get('game', '?')}: "
+                f"reviews={gk.get('total_reviews', {}).get('value', 0)}, "
+                f"auto-reply={gk.get('auto_reply_rate', {}).get('value', 0)}%, "
+                f"low-star={gk.get('low_star_pct', {}).get('value', 0)}%"
+            )
+
+        # Top topics
+        top_topics = ti.get("top_topics", [])[:5]
+        if top_topics:
+            data_summary += "\n\nTop topics:\n"
+            for t in top_topics:
+                data_summary += (
+                    f"  {t.get('rank', '?')}. {t.get('topic', '?')}: "
+                    f"count={t.get('count', 0)}, delta={t.get('delta', 0)} ({t.get('trend', '?')})\n"
+                )
+
+        emerging = ti.get("emerging", [])
+        declining = ti.get("declining", [])
+        if emerging:
+            data_summary += f"\nEmerging topics: {', '.join(e['topic'] for e in emerging[:3])}"
+        if declining:
+            data_summary += f"\nDeclining topics: {', '.join(d['topic'] for d in declining[:3])}"
+
+        # Pipeline
+        action_dist = ph.get("action_distribution", [])
+        if action_dist:
+            data_summary += "\n\nAction distribution: " + ", ".join(
+                f"{a['action']}={a['count']} ({a['pct']}%)" for a in action_dist
+            )
+
+        prompt = (
+            f"You are a data analyst writing an executive report for a Google Play review auto-reply system.\n"
+            f"Below is the data for this {period_word} ({label}). Write three concise narrative sections.\n\n"
+            f"DATA:\n{data_summary}\n\n"
+            f"Write:\n"
+            f"1. executive_summary: 2-3 sentences summarizing overall {period_word} performance — volume change, "
+            f"automation rate, and the single most notable trend. Use specific numbers.\n"
+            f"2. topic_insight: 2-3 sentences about the most significant topic changes — biggest mover, "
+            f"any emerging or declining topics. Be specific about which games are affected.\n"
+            f"3. pipeline_note: 1-2 sentences about pipeline health — confidence distribution, "
+            f"latency, and any concerns.\n\n"
+            f"Be factual, concise, and data-driven. No speculation. If a value is 0 or N/A, say so briefly."
+        )
+
+        result = _gen_json(
+            VERTEX_MODEL_STAGE2,
+            prompt,
+            max_tokens=512,
+            response_schema=REPORT_NARRATIVE_SCHEMA,
+            retries=1,
+            temperature=0.3,
+        )
+        if result and result.get("executive_summary"):
+            return result
+        return dict(_NARRATIVE_FALLBACK)
+    except Exception as e:
+        _log_event("report_narrative_failed", {"err": str(e)})
+        return dict(_NARRATIVE_FALLBACK)
+
+
+def _fs_read_report_cache(cache_key: str) -> Optional[Dict[str, Any]]:
+    """Read cached report from Firestore. Returns None if missing or expired."""
+    if not FIRESTORE_ENABLED:
+        return None
+    try:
+        _, project = _fs_init_auth()
+        token = _fs_get_token()
+        doc_id = _fs_safe_doc_id(cache_key)
+        url = _fs_doc_url(project, FIRESTORE_DATABASE, REPORT_CACHE_COLLECTION, doc_id)
+        headers = {"Authorization": f"Bearer {token}"}
+        resp = _HTTP.get(url, headers=headers, timeout=FIRESTORE_WRITE_TIMEOUT_SEC)
+        if resp.status_code != 200:
+            return None
+        doc = resp.json()
+        fields = doc.get("fields", {})
+        # The report JSON is stored as a single string field "data"
+        data_str = fields.get("data", {}).get("stringValue")
+        if not data_str:
+            return None
+        cached = json.loads(data_str)
+        # Check TTL
+        expires_at = fields.get("expires_at", {}).get("stringValue") or ""
+        if expires_at and expires_at < _utc_iso_now():
+            return None
+        return cached
+    except Exception:
+        return None
+
+
+def _fs_write_report_cache(cache_key: str, data: Dict[str, Any]) -> None:
+    """Write report data to cache collection."""
+    if not FIRESTORE_ENABLED:
+        return
+    try:
+        _, project = _fs_init_auth()
+        token = _fs_get_token()
+        doc_id = _fs_safe_doc_id(cache_key)
+        url = _fs_doc_url(project, FIRESTORE_DATABASE, REPORT_CACHE_COLLECTION, doc_id)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        expires = now + datetime.timedelta(hours=REPORT_CACHE_TTL_HOURS)
+        body = {
+            "fields": {
+                "data": _fs_value(json.dumps(data, ensure_ascii=False)),
+                "cache_key": _fs_value(cache_key),
+                "expires_at": _fs_value(expires.isoformat().replace("+00:00", "Z")),
+                "created_at": _fs_value(_utc_iso_now()),
+            }
+        }
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8",
+        }
+        _HTTP.patch(url, headers=headers, data=json.dumps(body), timeout=FIRESTORE_WRITE_TIMEOUT_SEC)
+    except Exception as e:
+        _log_event("report_cache_write_failed", {"key": cache_key, "err": str(e)})
+
+
+def _handle_report(request):
+    """GET /report?type=weekly|monthly&date=YYYY-MM-DD|YYYY-MM&game=ALL|GI|HSR|ZZZ"""
+    start_ms = _now_ms()
+
+    period_type = (request.args.get("type") or "").strip().lower()
+    if period_type not in ("weekly", "monthly"):
+        return json.dumps({"error": "type must be 'weekly' or 'monthly'"}), 400, JSON_HEADERS
+
+    date_str = (request.args.get("date") or "").strip()
+    if not date_str:
+        return json.dumps({"error": "date parameter required"}), 400, JSON_HEADERS
+
+    game = (request.args.get("game") or "ALL").strip().upper()
+    if game != "ALL" and game not in VALID_GAMES:
+        return json.dumps({"error": f"Invalid game. Must be ALL or one of: {sorted(VALID_GAMES)}"}), 400, JSON_HEADERS
+
+    try:
+        current_start, current_end, prior_start, prior_end, label, prior_label = _compute_period_ranges(period_type, date_str)
+    except Exception as e:
+        return json.dumps({"error": f"Invalid date: {e}"}), 400, JSON_HEADERS
+
+    # Check cache
+    cache_key = f"report__{period_type}__{label}__{game}"
+    cached = _fs_read_report_cache(cache_key)
+    if cached:
+        _log_event("report_cache_hit", {"key": cache_key, "latency_ms": _now_ms() - start_ms})
+        return json.dumps(cached, ensure_ascii=False), 200, JSON_HEADERS
+
+    # Fetch events for both periods
+    try:
+        current_events = _fs_query_events_by_date_range(current_start, current_end)
+        prior_events = _fs_query_events_by_date_range(prior_start, prior_end)
+    except Exception as e:
+        _log_event("report_query_failed", {"key": cache_key, "err": str(e)})
+        return json.dumps({"error": f"Failed to query events: {e}"}), 500, JSON_HEADERS
+
+    # Filter by game if not ALL
+    if game != "ALL":
+        current_events = [e for e in current_events if e.get("game") == game]
+        prior_events = [e for e in prior_events if e.get("game") == game]
+
+    # Compute metrics
+    metrics = _compute_report_metrics(current_events, prior_events, period_type, label, prior_label)
+
+    # Generate AI narrative
+    narrative = _generate_report_narrative(metrics, period_type, label)
+    metrics["narrative"] = narrative
+
+    # Add metadata
+    metrics["meta"] = {
+        "period_type": period_type,
+        "period_label": label,
+        "prior_label": prior_label,
+        "game_filter": game,
+        "current_range": {"start": current_start, "end": current_end},
+        "prior_range": {"start": prior_start, "end": prior_end},
+        "generated_at": _utc_iso_now(),
+        "current_event_count": len(current_events),
+        "prior_event_count": len(prior_events),
+        "latency_ms": _now_ms() - start_ms,
+    }
+
+    # Cache result
+    _fs_write_report_cache(cache_key, metrics)
+
+    _log_event("report_generated", {
+        "key": cache_key,
+        "current_events": len(current_events),
+        "prior_events": len(prior_events),
+        "latency_ms": _now_ms() - start_ms,
+    })
+
+    return json.dumps(metrics, ensure_ascii=False), 200, JSON_HEADERS
+
+
+def _handle_report_date_range(request):
+    """GET /report-date-range — returns the earliest event date in review_events."""
+    if not FIRESTORE_ENABLED:
+        return json.dumps({"earliest_date": None}), 200, JSON_HEADERS
+
+    try:
+        _, project = _fs_init_auth()
+        token = _fs_get_token()
+        base = f"https://firestore.googleapis.com/v1/projects/{project}/databases/{FIRESTORE_DATABASE}/documents"
+        url = f"{base}:runQuery"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"}
+
+        query_body = {
+            "structuredQuery": {
+                "from": [{"collectionId": FIRESTORE_COLLECTION}],
+                "orderBy": [{"field": {"fieldPath": "ingested_at"}, "direction": "ASCENDING"}],
+                "limit": 1,
+            }
+        }
+        resp = _HTTP.post(url, headers=headers, data=json.dumps(query_body), timeout=15)
+        resp.raise_for_status()
+
+        for item in resp.json():
+            doc = item.get("document")
+            if not doc:
+                continue
+            fields = doc.get("fields", {})
+            ingested = _fs_parse_value(fields.get("ingested_at", {}))
+            if ingested:
+                # Return just the date portion (YYYY-MM-DD)
+                return json.dumps({"earliest_date": ingested[:10]}), 200, JSON_HEADERS
+
+        return json.dumps({"earliest_date": None}), 200, JSON_HEADERS
+    except Exception as e:
+        _log_event("report_date_range_error", {"err": str(e)})
+        return json.dumps({"earliest_date": None}), 200, JSON_HEADERS
+
+
+# -----------------------------
 # Async helpers
 # -----------------------------
 def _enqueue_review_task(event_id: str, payload: Dict[str, Any]) -> bool:
@@ -2415,7 +3081,8 @@ def review_webhook(request):
 
     # Auth gate for tool/data endpoints
     if request.path in ("/analyze-topic", "/upload-ewma-csv", "/optimize-ewma",
-                         "/ewma-daily-data", "/ewma-upload-log", "/ewma-opt-history"):
+                         "/ewma-daily-data", "/ewma-upload-log", "/ewma-opt-history",
+                         "/report", "/report-date-range"):
         if not WEBHOOK_TOKEN:
             _log_event("tool_auth_skipped_no_token", {"path": request.path})
         else:
@@ -2443,6 +3110,13 @@ def review_webhook(request):
 
     if request.path == "/ewma-opt-history" and request.method == "GET":
         return _handle_ewma_opt_history(request)
+
+    # Route: Weekly/Monthly Report
+    if request.path == "/report" and request.method == "GET":
+        return _handle_report(request)
+
+    if request.path == "/report-date-range" and request.method == "GET":
+        return _handle_report_date_range(request)
 
     if not WEBHOOK_TOKEN:
         _log_event("webhook_auth_skipped_no_token", {"path": request.path})
