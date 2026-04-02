@@ -2606,19 +2606,12 @@ def _handle_report(request):
     prior_start = max(prior_start, SERVICE_LIVE_DATE)
     prior_end = max(prior_end, SERVICE_LIVE_DATE)
 
-    # Check cache
-    cache_key = f"report__{period_type}__{label}__{game}"
-    cached = _fs_read_report_cache(cache_key)
-    if cached:
-        _log_event("report_cache_hit", {"key": cache_key, "latency_ms": _now_ms() - start_ms})
-        return json.dumps(cached, ensure_ascii=False), 200, JSON_HEADERS
-
-    # Fetch events for both periods
+    # Fetch events for both periods (always live, no caching)
     try:
         current_events = _fs_query_events_by_date_range(current_start, current_end)
         prior_events = _fs_query_events_by_date_range(prior_start, prior_end)
     except Exception as e:
-        _log_event("report_query_failed", {"key": cache_key, "err": str(e)})
+        _log_event("report_query_failed", {"err": str(e)})
         return json.dumps({"error": f"Failed to query events: {e}"}), 500, JSON_HEADERS
 
     # Filter by game if not ALL
@@ -2651,11 +2644,7 @@ def _handle_report(request):
         "latency_ms": _now_ms() - start_ms,
     }
 
-    # Cache result
-    _fs_write_report_cache(cache_key, metrics)
-
     _log_event("report_generated", {
-        "key": cache_key,
         "current_events": len(current_events),
         "prior_events": len(prior_events),
         "latency_ms": _now_ms() - start_ms,
