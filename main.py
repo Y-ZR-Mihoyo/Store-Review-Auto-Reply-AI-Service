@@ -2659,7 +2659,7 @@ def _handle_report(request):
 
 
 def _handle_report_date_range(request):
-    """GET /report-date-range — returns the earliest event date in review_events."""
+    """GET /report-date-range — returns the earliest real (evt_gp_) event date."""
     if not FIRESTORE_ENABLED:
         return json.dumps({"earliest_date": None}), 200, JSON_HEADERS
 
@@ -2670,11 +2670,12 @@ def _handle_report_date_range(request):
         url = f"{base}:runQuery"
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"}
 
+        # Fetch a batch and find the first evt_gp_ event (can't prefix-filter in Firestore)
         query_body = {
             "structuredQuery": {
                 "from": [{"collectionId": FIRESTORE_COLLECTION}],
                 "orderBy": [{"field": {"fieldPath": "ingested_at"}, "direction": "ASCENDING"}],
-                "limit": 1,
+                "limit": 200,
             }
         }
         resp = _HTTP.post(url, headers=headers, data=json.dumps(query_body), timeout=15)
@@ -2685,9 +2686,11 @@ def _handle_report_date_range(request):
             if not doc:
                 continue
             fields = doc.get("fields", {})
+            eid = _fs_parse_value(fields.get("event_id", {})) or ""
+            if not eid.startswith("evt_gp_"):
+                continue
             ingested = _fs_parse_value(fields.get("ingested_at", {}))
             if ingested:
-                # Return just the date portion (YYYY-MM-DD)
                 return json.dumps({"earliest_date": ingested[:10]}), 200, JSON_HEADERS
 
         return json.dumps({"earliest_date": None}), 200, JSON_HEADERS
