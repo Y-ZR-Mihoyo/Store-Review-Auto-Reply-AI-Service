@@ -167,6 +167,7 @@ VALID_GAMES = {"GI", "HSR", "ZZZ"}
 # Report config
 REPORT_CACHE_COLLECTION = "report_cache"
 REPORT_CACHE_TTL_HOURS = 4
+SERVICE_LIVE_DATE = "2026-03-27T00:00:00Z"  # Pipeline went live; ignore data before this
 
 
 def _log_event(msg: str, data: Dict[str, Any]) -> None:
@@ -2600,6 +2601,11 @@ def _handle_report(request):
     except Exception as e:
         return json.dumps({"error": f"Invalid date: {e}"}), 400, JSON_HEADERS
 
+    # Clamp to service go-live date
+    current_start = max(current_start, SERVICE_LIVE_DATE)
+    prior_start = max(prior_start, SERVICE_LIVE_DATE)
+    prior_end = max(prior_end, SERVICE_LIVE_DATE)
+
     # Check cache
     cache_key = f"report__{period_type}__{label}__{game}"
     cached = _fs_read_report_cache(cache_key)
@@ -2659,44 +2665,8 @@ def _handle_report(request):
 
 
 def _handle_report_date_range(request):
-    """GET /report-date-range — returns the earliest real (evt_gp_) event date."""
-    if not FIRESTORE_ENABLED:
-        return json.dumps({"earliest_date": None}), 200, JSON_HEADERS
-
-    try:
-        _, project = _fs_init_auth()
-        token = _fs_get_token()
-        base = f"https://firestore.googleapis.com/v1/projects/{project}/databases/{FIRESTORE_DATABASE}/documents"
-        url = f"{base}:runQuery"
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"}
-
-        # Fetch a batch and find the first evt_gp_ event (can't prefix-filter in Firestore)
-        query_body = {
-            "structuredQuery": {
-                "from": [{"collectionId": FIRESTORE_COLLECTION}],
-                "orderBy": [{"field": {"fieldPath": "ingested_at"}, "direction": "ASCENDING"}],
-                "limit": 200,
-            }
-        }
-        resp = _HTTP.post(url, headers=headers, data=json.dumps(query_body), timeout=15)
-        resp.raise_for_status()
-
-        for item in resp.json():
-            doc = item.get("document")
-            if not doc:
-                continue
-            fields = doc.get("fields", {})
-            eid = _fs_parse_value(fields.get("event_id", {})) or ""
-            if not eid.startswith("evt_gp_"):
-                continue
-            ingested = _fs_parse_value(fields.get("ingested_at", {}))
-            if ingested:
-                return json.dumps({"earliest_date": ingested[:10]}), 200, JSON_HEADERS
-
-        return json.dumps({"earliest_date": None}), 200, JSON_HEADERS
-    except Exception as e:
-        _log_event("report_date_range_error", {"err": str(e)})
-        return json.dumps({"earliest_date": None}), 200, JSON_HEADERS
+    """GET /report-date-range — returns the service go-live date."""
+    return json.dumps({"earliest_date": SERVICE_LIVE_DATE[:10]}), 200, JSON_HEADERS
 
 
 # -----------------------------
