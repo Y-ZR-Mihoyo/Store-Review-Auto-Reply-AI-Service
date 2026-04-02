@@ -2628,6 +2628,8 @@ def _handle_report(request):
     metrics["narrative"] = narrative
 
     # Add metadata
+    total_days = (datetime.datetime.fromisoformat(current_end.replace("Z", "")) -
+                  datetime.datetime.fromisoformat(current_start.replace("Z", ""))).days
     metrics["meta"] = {
         "period_type": period_type,
         "period_label": label,
@@ -2638,6 +2640,8 @@ def _handle_report(request):
         "generated_at": _utc_iso_now(),
         "current_event_count": len(current_events),
         "prior_event_count": len(prior_events),
+        "days_with_data": len(metrics.get("daily_volume", [])),
+        "total_days_in_period": total_days,
         "latency_ms": _now_ms() - start_ms,
     }
 
