@@ -629,6 +629,7 @@ Classify the review into EXACTLY ONE bucket:
 Examples:
 - "This game is racist against [group], disgusting."
 - "They portray [nationality] as evil, boycott them."
+- Criticisms targeting the company's nationality or national identity: "Chinese company", "ch公司", "Korean game company", negative stereotyping based on country of origin
 
 **POLITICS_RELATED**: Real-world politics, governments, territorial disputes, propaganda, sanctions, wars, political ideologies
 Examples:
@@ -642,6 +643,8 @@ Examples:
 NOT gender opposition (classify as NONE instead):
 - Gaming slang: "waifu bait", "husbando collector" - these are game design criticisms, not gender politics
 - Character design preferences without actual gender/political arguments
+HOWEVER: If the review uses fan-service/character preference language BUT ALSO demeans a gender group ("girls are boring", "female characters are useless") or makes derogatory gender comparisons → GENDER_OPPOSITION_AND_RELATED. The exception only applies to neutral preferences WITHOUT demeaning language.
+Example: "female fan service is overrated, girls are so boring" → GENDER_OPPOSITION_AND_RELATED
 EXCEPTION: Concerns about characters looking like children/minors → HIGHLY_SENSITIVE_OTHER (not NONE)
 
 **UNRELATED_TO_GAME**: Complaints totally unrelated to the game itself (delivery issues, personal life, random spam, political rants not tied to game)
@@ -649,6 +652,8 @@ IMPORTANT: Device compatibility, technical issues, crashes, and lag ARE related 
 Examples of UNRELATED:
 - "My parcel didn't arrive."
 - "This company is a scam." (generic company complaint)
+- Company-directed hostility/profanity: reviews that attack the COMPANY itself rather than critiquing specific game features, even if a game is mentioned by name. Core message is "[company] is trash", vulgar insults, profanity directed at developers/company.
+  Example: "米哈游出品必屬賤品 吃一坨吧" (miHoYo products are trash, eat sh*t) → UNRELATED_TO_GAME
 Examples that ARE related (use NONE, not UNRELATED):
 - "Game doesn't work on my device"
 - "Game crashes/lags"
@@ -680,6 +685,8 @@ Examples:
 - References to sexual content genres or tropes: "yaoi", "yuri", "BL/boys love", "GL", "hentai", "ecchi", "R18", "NSFW", "smut", "lewd", or requests for sexual/romantic fan-service content
 - Violence from real events, simulation of violent crimes, extremism
 - Concerns about characters resembling minors/children, age-inappropriate character designs, "looks like a child", child safety concerns
+- Fan service concerns tied to age ratings: "fan service for PG-12/PG-13", age-appropriateness of sexual content, "too sexual for kids"
+- Nudity expectations/disappointment: reviews expressing desire for nudity or disappointment about lack of nudity ("didn't take off clothes", "want nudity", "where's the nudity")
 
 [Other Specific Issues]
 - Game content censorship debates
@@ -688,6 +695,9 @@ Examples:
   → ANY mention of "strike" or "unvoiced due to strike" triggers this category
 - Character diversity complaints ("lack of diversity", "no diversity", "character diversity")
   → ANY mention triggers this, regardless of tone
+- Community/fanbase attacks: reviews that DEHUMANIZE or ATTACK the player community/fanbase
+  → Calling players animals (dogs, pigs, etc.), using slurs against the community, demanding the community be "leashed"/"controlled"/"punished", inciting hostility against the player base
+  → NOT: opinions like "the community is toxic" or "bad community" — these are just opinions, classify as NONE
 
 **NONE**: None of the above sensitive categories apply - safe to proceed to Stage 2
 
@@ -731,7 +741,7 @@ Return valid JSON only. No extra keys.
    - "具体问题的差评 Reasonable Low Score with specific problems" → GENERAL_ISSUE
    - "无缘由差评 Unreasonable Low Score" → GENERAL_ISSUE
 
-2. 恶意差评 is the DEFAULT for game design complaints. Use 具体问题的差评 ONLY for pay-to-win / monetization design complaints OR network/connection issues without an explicit error code (see Step 2b).
+2. 恶意差评 is the DEFAULT for game design complaints. Use 具体问题的差评 ONLY for: (a) pay-to-win / competitive-mechanics complaints (NOT vague cost complaints), (b) network/connection issues without an explicit error code, (c) in-game technical bugs/glitches, or (d) software regressions (see Step 2b).
 
 3. MULTILINGUAL: Reviews may be in ANY language. The keywords listed below are English examples only.
 
@@ -751,20 +761,21 @@ STEP 1: SPECIFIC_ISSUE topics (check these first)
     - Complaints about ads, YouTube, or external apps (e.g., "your ad breaks my youtube") → use 恶意差评
     - General negativity that doesn't mention an actual error → use 恶意差评
     - Vague use of "error" not referring to a game error code/message → use the appropriate topic
+    - Bug/crash descriptions that incidentally mention "error": if the review describes multiple in-game bugs (texture glitches, physics bugs, crashes) and mentions "fatal error" or "crash error" as one symptom among many → NOT Error Code. Error Code is for reviews whose PRIMARY complaint is a specific error code or error message, not for broad bug reports. Use 具体问题的差评 instead.
     Examples: "Login error", "error code 1001", "game shows error when I open it"
 
 1b. DOWNLOAD → "Download Issue"
-    If review contains "download" or "install" → Download Issue
+    If review contains "download", "install", "update", "resource integrity", "checking resources", "verifying files", "resource download", "stuck at loading resources" → Download Issue
     EXCEPT: if the download/install problem is CAUSED BY the game being too large (mentions size, storage, GB, "too big", "too heavy", "takes too much space"), apply the ROOT CAUSE RULE — the root cause is Big Size, not the download itself. Use Big Size instead.
 
 1c. STORAGE → "Big Size"
     If review mentions storage/space ("storage", "space", "memory", "too big", "gb", "size", "too heavy", "too large")
     → Big Size
     This includes cases where download is mentioned but the ROOT CAUSE is the game's large size (e.g., "can't download, too big", "download takes forever because of the size", "game eats all my storage").
-    IMPORTANT OVERRIDE: If the review mentions inability to play/load/run the game ("can't play", "can't load", "won't run", "unable to play", "can't even play"), Device Issues ALWAYS takes precedence over Big Size — even if storage/size keywords are present. The user needs the Device Issues template (system requirements advice), not storage tips.
+    IMPORTANT — "can't play" + storage context: If the review mentions inability to play AND the explicitly stated reason is STORAGE/SIZE (e.g., "takes all my storage", "no space left", "too big to fit", "storage not enough") → Big Size. If the reason is PERFORMANCE/COMPATIBILITY (e.g., "crashes", "lags", "too slow") → Device Issues.
 
 1d. DEVICE ISSUES → "Device Issues" (STRICT CRITERIA)
-    If storage keywords are present but the user says they can't play/load/run the game → Device Issues takes precedence (storage is just the symptom; the user needs system requirements advice)
+    If the user says they can't play due to PERFORMANCE (crashes, lag, compatibility) → Device Issues. But if can't play is due to STORAGE/SIZE being the stated reason → use Big Size instead (see 1c).
     REQUIRES explicit device context. Use ONLY if review has:
     - Device words: "phone", "tablet", "device", "my [device name]", "older devices"
     - Optimization: "optimize", "optimisation", "optimization"
@@ -779,6 +790,7 @@ STEP 1: SPECIFIC_ISSUE topics (check these first)
     - "Technical issues" without device context AND without crash root cause → use Account issues
     - "Plays terribly" (subjective quality criticism) → use 恶意差评
     - Network/connection issues without device context → use 具体问题的差评
+    REGRESSION EXCEPTION: If the review explicitly states the game USED TO WORK on the same device and RECENTLY BROKE ("never happened before", "worked fine before", "since the last update", "after the update", "used to be fine"), the root cause is likely a software regression, NOT device compatibility → use 具体问题的差评 instead of Device Issues. The player's device hasn't changed; the software did.
 
 1e. ACCOUNT/TECH ISSUES → "Account issues"
     Use for:
@@ -812,10 +824,20 @@ STEP 1: SPECIFIC_ISSUE topics (check these first)
         - "not enough primogems/stellar jade/polychrome", "stingy rewards", "give more rewards"
         - "HSR/ZZZ gives more [rewards] than this game", reward system comparisons
         - These are implicit suggestions for more generous rewards
+    (d) Implicit skip/speed-up feature requests: reviews whose core complaint is the inability to skip dialogue/cutscenes or slow dialogue speed
+        - Keywords: "can't skip", "no skip button", "unskippable", "need skip", "skip option", "too much dialogue can't skip"
+        - Tone must be neutral, polite, or mildly frustrated (NOT hostile/abusive)
+        - If skip is mentioned inside a hostile broader rant → use 恶意差评 instead
+    (e) Game balance requests: "balance X", "nerf X", "buff X", "fix X balance", "rebalance"
+        - These are requests to adjust game mechanics — classify as Suggestions
+        - Applies in ANY language (e.g. Indonesian "imbangin" = "balance")
+
+    TONE PRIORITY RULE: When a review contains BOTH polite/request language ("please", "wish", action verbs) AND frustrated tone, the Suggestion classification takes priority. Frustration doesn't negate a clear feature request.
 
     Do NOT use Suggestions for:
     - Vague complaints without specific reward/currency mention or request: "game is stingy", "everything is bad" → use 恶意差评
     - Hostile/vague negativity without actionable request: "trash game", "boring" → use 恶意差评
+    - Skip mentioned in a hostile broader rant: "trash game can't even skip the boring dialogue" → use 恶意差评
     - Complaints about gacha PULL MECHANICS or luck: "lost 50/50", "didn't get the character" → use Gacha/drop
 
     Examples:
@@ -826,7 +848,11 @@ STEP 1: SPECIFIC_ISSUE topics (check these first)
     - "not enough primogems, give us more" → Suggestions (reward amount + specific currency)
     - "мало наград сделайте больше примогемов" → Suggestions (imperative + reward feedback)
     - "HSR gives 100 wishes per update, we only get 60" → Suggestions (reward comparison)
-    - "Still no skip button" → 恶意差评 (complaint, no request or action verb)
+    - "SLOW dialogue, unskippable cutscenes" → Suggestions (core complaint is unskippable content, non-hostile)
+    - "Still no skip button on long quests" → Suggestions (implicit skip feature request, non-hostile tone)
+    - "muito diálogo desnecessário, e não dá pra pular nada" → Suggestions (skip request in Portuguese, non-hostile)
+    - "power creep mulu, imbangin semua lah" → Suggestions (balance request in Indonesian, "imbangin" = "balance")
+    - "trash game can't even skip the boring dialogue" → 恶意差评 (hostile tone, skip in broader rant)
     - "Stingy gacha and extremely grindy" → 恶意差评 (gacha is brief mention in broader complaint)
 
 STEP 2: GENERAL_ISSUE topics (only if no SPECIFIC_ISSUE matches)
@@ -847,10 +873,12 @@ STEP 2: GENERAL_ISSUE topics (only if no SPECIFIC_ISSUE matches)
 
 2b. PAY-TO-WIN / MONETIZATION DESIGN / NETWORK ISSUES → "具体问题的差评 Reasonable Low Score with specific problems" (GENERAL_ISSUE)
     Use for:
-    (a) Monetization DESIGN complaints: "pay to win", "p2w", "money grab", "cash grab",
-        "aggressive monetization", "only whales can compete", "need to spend money to progress",
-        "free players can't compete".
-        These are complaints about the game's monetization DESIGN, not about specific gacha pull outcomes.
+    (a) Monetization DESIGN complaints about COMPETITIVE MECHANICS: "pay to win", "p2w",
+        "only whales can compete", "need to spend money to progress",
+        "free players can't compete", "whale dominance".
+        IMPORTANT EXCLUSION: Vague cost/price complaints WITHOUT p2w or competitive-advantage language → use 恶意差评:
+        - "too expensive", "overpriced", "money grab", "cash grab", "costs too much", "aggressive monetization" → 恶意差评
+        - 具体问题的差评 is ONLY for complaints about competitive mechanics (p2w, whale dominance, unfair advantage)
         If the user is upset about spending money and NOT getting a specific character/item → use Gacha/drop instead.
     (b) Network/connection issues WITHOUT an explicit error code: "connection lost",
         "network error", "can't connect", "server timeout", "timed out", "lag",
@@ -858,6 +886,10 @@ STEP 2: GENERAL_ISSUE topics (only if no SPECIFIC_ISSUE matches)
         problems, not device problems.
         IMPORTANT: If the review mentions a specific error code alongside network issues
         (e.g. "network error code 4206"), use Error Code instead (already matched in Step 1a).
+    (c) In-game technical bugs/glitches: reviews describing specific, clearly unintended bugs — texture glitches, falling through map, hitbox issues, damage not registering, physics bugs, graphical artifacts.
+        These are TECHNICAL BUGS (things that should not happen), not DESIGN complaints (things working as intended but disliked).
+        If the review mentions "error" incidentally while describing bugs → NOT Error Code (see 1a exclusion).
+    (d) Software regressions: reviews that explicitly state the game USED TO WORK and recently broke — "after the update everything broke", "never happened before", "worked fine until the last patch". These are likely software bugs introduced by an update, not device compatibility issues.
 
 2c. SHORT/VAGUE/CONTRADICTORY → "无缘由差评 Unreasonable Low Score" (GENERAL_ISSUE)
     Use for reviews where the low rating doesn't match the text:
@@ -883,8 +915,8 @@ STEP 2: GENERAL_ISSUE topics (only if no SPECIFIC_ISSUE matches)
 | "Please add more rewards" | Suggestions | polite keyword ("please") |
 | "Remove the resin/trailblaze power/battery system" | Suggestions | direct action request ("remove X") |
 | "удалите астральный предел" | Suggestions | imperative request ("удалите" = "remove", HSR) |
-| "SLOW dialogue, unskippable cutscenes" | 恶意差评 | complaint, no request or action verb |
-| "Still no skip button on long quests" | 恶意差评 | complaint, no action verb |
+| "SLOW dialogue, unskippable cutscenes" | Suggestions | core complaint is unskippable content, non-hostile |
+| "Still no skip button on long quests" | Suggestions | implicit skip feature request, non-hostile tone |
 | "not enough primogems, give us more" | Suggestions | reward amount complaint with specific currency |
 | "HSR gives 100 wishes per update, we only get 60" | Suggestions | reward comparison with other game |
 | "game sangat kikir" / "game is stingy" | 恶意差评 | vague general complaint, no specific gacha/reward |
@@ -907,7 +939,16 @@ STEP 2: GENERAL_ISSUE topics (only if no SPECIFIC_ISSUE matches)
 | "can't download, game is too big" | Big Size | download caused by game size → root cause is Big Size |
 | "download it...eat my gb space" | Big Size | download caused by large size → root cause is Big Size |
 | "download stuck at 50%" | Download Issue | download problem, no size/storage cause |
-| "can't play it on my phone, takes all my storage" | Device Issues | can't play + device = Device Issues, even with storage mention |
+| "can't play it on my phone, takes all my storage" | Big Size | can't play but stated reason is storage → Big Size |
+| "muito diálogo desnecessário, e não dá pra pular nada" | Suggestions | skip request in Portuguese, non-hostile |
+| "trash game can't even skip the boring dialogue" | 恶意差评 | hostile tone, skip in broader rant |
+| "слишком дорого" / "too expensive" | 恶意差评 | vague cost complaint, no p2w |
+| "skins are overpriced" | 恶意差评 | pricing opinion, not competitive advantage |
+| "power creep mulu, imbangin semua lah" | Suggestions | balance request in Indonesian ("imbangin" = "balance") |
+| "storage required is outrageous...can't play until new phone" | Big Size | stated reason is storage |
+| "Checking Resource Integrity stuck at 0%" | Download Issue | resource verification = download process |
+| "Doesn't load past logo screen, never happened before in 2+ years" | 具体问题的差评 | used to work → software regression |
+| "bugs everywhere, fatal error mid-fight, after update" | 具体问题的差评 | in-game bugs + regression, not Error Code |
 
 Available topics: [{topics_str}]
 
