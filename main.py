@@ -3416,4 +3416,9 @@ def review_webhook(request):
     # Synchronous processing (default, or async fallback)
     # -----------------------------
     result, _ = _process_review(payload)
+    # When the async enqueue fails and we fall through here, CSC still expects a
+    # callback push (not just an HTTP response body) to actually post the reply.
+    # Mirror the /internal/process behavior so the callback contract is honored
+    # regardless of which path produced the result.
+    _call_csc_callback(event_id, result)
     return json.dumps(result, ensure_ascii=False), 200, JSON_HEADERS
