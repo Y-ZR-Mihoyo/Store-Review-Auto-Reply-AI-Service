@@ -1327,6 +1327,212 @@ def _firestore_write_review_event_best_effort(
 
 
 # -----------------------------
+# Rating update tracking (CSC rating_updated webhook)
+# -----------------------------
+RATING_UPDATES_COLLECTION = os.getenv("RATING_UPDATES_COLLECTION", "rating_updates").strip()
+
+
+def _fs_query_review_event_by_order_id(order_id: Any) -> Optional[Dict[str, Any]]:
+    """Find the original REPLY_AND_CLOSE review_events doc for a given order_id.
+    Returns the parsed doc dict or None if not found / Firestore disabled."""
+    if not FIRESTORE_ENABLED:
+        return None
+    try:
+        _, project = _fs_init_auth()
+        token = _fs_get_token()
+        base = f"https://firestore.googleapis.com/v1/projects/{project}/databases/{FIRESTORE_DATABASE}/documents"
+        url = f"{base}:runQuery"
+
+        query_body = {
+            "structuredQuery": {
+                "from": [{"collectionId": FIRESTORE_COLLECTION}],
+                "where": {
+                    "compositeFilter": {
+                        "op": "AND",
+                        "filters": [
+                            {
+                                "fieldFilter": {
+                                    "field": {"fieldPath": "order_id"},
+                                    "op": "EQUAL",
+                                    "value": {"stringValue": str(order_id)},
+                                }
+                            },
+                            {
+                                "fieldFilter": {
+                                    "field": {"fieldPath": "action"},
+                                    "op": "EQUAL",
+                                    "value": {"stringValue": "REPLY_AND_CLOSE"},
+                                }
+                            },
+                        ],
+                    }
+                },
+                "limit": 1,
+            }
+        }
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8",
+        }
+        resp = _HTTP.post(url, headers=headers, data=json.dumps(query_body), timeout=FIRESTORE_WRITE_TIMEOUT_SEC)
+        if resp.status_code != 200:
+            _log_event("rating_update_lookup_failed", {
+                "order_id": str(order_id),
+                "http_status": resp.status_code,
+                "resp_snippet": _truncate(resp.text, 500),
+            })
+            return None
+
+        for item in resp.json():
+            doc = item.get("document")
+            if not doc:
+                continue
+            fields = doc.get("fields", {})
+            return {k: _fs_parse_value(v) for k, v in fields.items()}
+        return None
+    except Exception as e:
+        _log_event("rating_update_lookup_failed", {"order_id": str(order_id), "err": str(e)})
+        return None
+
+
+def _firestore_write_rating_update_best_effort(
+    *,
+    event_id: str,
+    record: Dict[str, Any],
+) -> None:
+    """Write a rating_updated event to the rating_updates collection."""
+    if not FIRESTORE_ENABLED:
+        return
+    try:
+        _, project = _fs_init_auth()
+        token = _fs_get_token()
+        doc_id = _fs_safe_doc_id(event_id)
+        url = _fs_doc_url(project, FIRESTORE_DATABASE, RATING_UPDATES_COLLECTION, doc_id)
+        body = {"fields": {k: _fs_value(v) for k, v in record.items()}}
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8",
+        }
+        resp = _HTTP.patch(url, headers=headers, data=json.dumps(body), timeout=FIRESTORE_WRITE_TIMEOUT_SEC)
+        if 200 <= resp.status_code < 300:
+            _log_event("rating_update_write_ok", {
+                "event_id": event_id,
+                "collection": RATING_UPDATES_COLLECTION,
+            })
+            return
+        _log_event("rating_update_write_failed", {
+            "event_id": event_id,
+            "http_status": resp.status_code,
+            "resp_snippet": _truncate(resp.text, 500),
+        })
+    except Exception as e:
+        _log_event("rating_update_write_failed", {"event_id": event_id, "err": str(e)})
+
+
+def _handle_rating_updated(payload: Dict[str, Any]) -> Tuple[str, int, Dict[str, str]]:
+    """Handle CSC rating_updated webhook events.
+
+    Per v2.25 spec: CSC pushes when a previously auto-replied review is edited.
+    We log the delta to Firestore for conversion analysis. No LLM, no callback.
+    """
+    order_id = payload.get("order_id")
+    event_id = payload.get("event_id")
+    rating = payload.get("rating")
+    old_rating = payload.get("old_rating")
+    updated_at = payload.get("updated_at")
+    game_biz = payload.get("game_biz")
+
+    if (
+        order_id is None
+        or rating is None
+        or old_rating is None
+        or updated_at is None
+        or not event_id
+        or not game_biz
+    ):
+        _log_event("rating_update_missing_fields", {
+            "event_id": event_id,
+            "order_id": order_id,
+            "has_rating": rating is not None,
+            "has_old_rating": old_rating is not None,
+            "has_updated_at": updated_at is not None,
+            "has_game_biz": bool(game_biz),
+        })
+        return "missing required fields", 400, JSON_HEADERS
+
+    # Idempotency: if we've already written this event_id, return 200 without rewriting.
+    # Firestore PATCH is idempotent on its own, but we short-circuit to avoid the network round-trip.
+    if FIRESTORE_ENABLED:
+        try:
+            _, project = _fs_init_auth()
+            token = _fs_get_token()
+            doc_id = _fs_safe_doc_id(event_id)
+            url = _fs_doc_url(project, FIRESTORE_DATABASE, RATING_UPDATES_COLLECTION, doc_id)
+            headers = {"Authorization": f"Bearer {token}"}
+            resp = _HTTP.get(url, headers=headers, timeout=FIRESTORE_WRITE_TIMEOUT_SEC)
+            if resp.status_code == 200:
+                _log_event("rating_update_idempotent_hit", {"event_id": event_id, "order_id": str(order_id)})
+                ack = {"status": "ok", "event_id": event_id, "order_id": str(order_id)}
+                return json.dumps(ack, ensure_ascii=False), 200, JSON_HEADERS
+        except Exception:
+            pass  # fall through to normal write
+
+    # Lookup the original REPLY_AND_CLOSE event so we can attribute the delta.
+    original = _fs_query_review_event_by_order_id(order_id)
+
+    rating_delta: Optional[int] = None
+    text_changed: Optional[bool] = None
+    try:
+        rating_delta = int(rating) - int(old_rating)
+    except (TypeError, ValueError):
+        rating_delta = None
+
+    body = payload.get("body")
+    old_body = payload.get("old_body")
+    if body is not None and old_body is not None:
+        text_changed = (body != old_body)
+
+    record: Dict[str, Any] = {
+        "event_id": event_id,
+        "event_type": "rating_updated",
+        "order_id": str(order_id),
+        "game_biz": payload.get("game_biz"),
+        "review_id": payload.get("review_id"),
+        "language": payload.get("language"),
+        "territory": payload.get("territory"),
+        "rating": rating,
+        "old_rating": old_rating,
+        "rating_delta": rating_delta,
+        "body": body,
+        "old_body": old_body,
+        "text_changed": text_changed,
+        "updated_at": updated_at,
+        "ingested_at": _utc_iso_now(),
+        # Attribution to the original auto-reply (None if no prior REPLY_AND_CLOSE found)
+        "original_event_id": (original or {}).get("event_id"),
+        "original_template_id": (original or {}).get("template_id"),
+        "original_action": (original or {}).get("action"),
+        "original_rating": (original or {}).get("rating"),
+        "original_review_at": (original or {}).get("review_at"),
+        "original_found": original is not None,
+    }
+
+    _firestore_write_rating_update_best_effort(event_id=event_id, record=record)
+
+    _log_event("rating_update_received", {
+        "event_id": event_id,
+        "order_id": str(order_id),
+        "rating_delta": rating_delta,
+        "text_changed": text_changed,
+        "original_found": original is not None,
+    })
+
+    ack = {"status": "ok", "event_id": event_id, "order_id": str(order_id)}
+    return json.dumps(ack, ensure_ascii=False), 200, JSON_HEADERS
+
+
+# -----------------------------
 # Topic analysis (sub-issue drill-down)
 # -----------------------------
 TOPIC_ANALYSIS_COLLECTION = "topic_analysis"
@@ -3140,6 +3346,11 @@ def review_webhook(request):
         payload = request.get_json(silent=False)
     except Exception:
         return "invalid json", 400
+
+    # Branch: rating_updated events are tracking-only (no LLM, no callback).
+    # Per v2.25 spec: CSC pushes rating/comment edits for previously auto-replied reviews.
+    if payload.get("event_type") == "rating_updated":
+        return _handle_rating_updated(payload)
 
     order_id = payload.get("order_id")
     event_id = payload.get("event_id") or f"evt_{order_id}_{int(time.time())}"
