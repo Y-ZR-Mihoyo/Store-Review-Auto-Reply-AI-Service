@@ -1525,12 +1525,16 @@ def _handle_rating_updated(payload: Dict[str, Any]) -> Tuple[str, int, Dict[str,
         "text_changed": text_changed,
         "updated_at": updated_at,
         "ingested_at": _utc_iso_now(),
-        # Attribution to the original auto-reply (None if no prior REPLY_AND_CLOSE found)
+        # Attribution to the original auto-reply (None if no prior REPLY_AND_CLOSE found).
+        # We surface the parent's Stage 2 classification so the dashboard can show
+        # "user edited their <Login error> review" instead of an empty Issue/Topic cell.
         "original_event_id": (original or {}).get("event_id"),
         "original_template_id": (original or {}).get("template_id"),
         "original_action": (original or {}).get("action"),
         "original_rating": (original or {}).get("rating"),
         "original_review_at": (original or {}).get("review_at"),
+        "original_stage2_issue_type": (original or {}).get("stage2_issue_type"),
+        "original_stage2_topic": (original or {}).get("stage2_topic"),
         "original_found": original is not None,
     }
 
