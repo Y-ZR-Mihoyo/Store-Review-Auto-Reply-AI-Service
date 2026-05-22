@@ -1343,6 +1343,28 @@ def _fs_query_review_event_by_order_id(order_id: Any) -> Optional[Dict[str, Any]
         base = f"https://firestore.googleapis.com/v1/projects/{project}/databases/{FIRESTORE_DATABASE}/documents"
         url = f"{base}:runQuery"
 
+        # review_events docs store order_id as integerValue (the original CSC payload sends
+        # an int that we forward to Firestore via _fs_value's int branch). Querying with
+        # stringValue won't match -- we have to use integerValue, which Firestore expects
+        # as a stringified integer. Fall back to string filter only if the value can't be
+        # parsed as int (defensive — should never happen for real CSC events).
+        try:
+            order_id_filter: Dict[str, Any] = {
+                "fieldFilter": {
+                    "field": {"fieldPath": "order_id"},
+                    "op": "EQUAL",
+                    "value": {"integerValue": str(int(order_id))},
+                }
+            }
+        except (TypeError, ValueError):
+            order_id_filter = {
+                "fieldFilter": {
+                    "field": {"fieldPath": "order_id"},
+                    "op": "EQUAL",
+                    "value": {"stringValue": str(order_id)},
+                }
+            }
+
         query_body = {
             "structuredQuery": {
                 "from": [{"collectionId": FIRESTORE_COLLECTION}],
@@ -1350,13 +1372,7 @@ def _fs_query_review_event_by_order_id(order_id: Any) -> Optional[Dict[str, Any]
                     "compositeFilter": {
                         "op": "AND",
                         "filters": [
-                            {
-                                "fieldFilter": {
-                                    "field": {"fieldPath": "order_id"},
-                                    "op": "EQUAL",
-                                    "value": {"stringValue": str(order_id)},
-                                }
-                            },
+                            order_id_filter,
                             {
                                 "fieldFilter": {
                                     "field": {"fieldPath": "action"},
