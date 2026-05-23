@@ -2947,8 +2947,14 @@ def _build_review_events_bundle() -> bytes:
     """Build a Firestore bundle containing the entire review_events collection.
 
     Uses the Python admin SDK (google-cloud-firestore) to materialize a full
-    snapshot + a named query the FE can subscribe to. Heavy operation (~few seconds
-    at 100k docs); caller is responsible for caching.
+    snapshot + a named query the FE can subscribe to. Heavy operation (~tens of
+    seconds at 100k+ docs); caller is responsible for caching.
+
+    Implementation note: the SDK's Query.stream() trips an internal retry-path
+    bug on Cloud Run ('_UnaryStreamMultiCallable' has no attribute '_retry')
+    when fetching very large result sets. Query.get() goes through a different
+    code path that doesn't have this issue, and is fine here because we have to
+    materialize all docs into memory anyway to add them to the bundle.
     """
     from google.cloud import firestore as gcf
     from google.cloud.firestore_bundle import FirestoreBundle
@@ -2956,14 +2962,17 @@ def _build_review_events_bundle() -> bytes:
     client = gcf.Client(project=_project_id(), database=FIRESTORE_DATABASE)
     bundle = FirestoreBundle("review-events-bundle")
 
-    # Named query the FE will subscribe to via namedQuery(db, 'review-events-all').
     coll = client.collection(FIRESTORE_COLLECTION)
     q = coll.order_by("ingested_at", direction=gcf.Query.DESCENDING)
 
-    # Materialize the snapshot once and reuse for both the named-query registration
-    # and the per-doc adds. add_named_query takes the query (no docs needed); we
-    # then add each DocumentSnapshot we already fetched.
-    snapshots = list(q.stream())
+    # On Cloud Run, the SDK's default retry path crashes with
+    # "'_UnaryStreamMultiCallable' object has no attribute '_retry'" when the
+    # gapic stub was created without the retry decoration the firestore Query
+    # code expects. Passing retry=None bypasses the retry lookup entirely; the
+    # underlying gRPC call still has its own transport-level retries, so giving
+    # up the application-level retry is acceptable here (we cache the bundle
+    # for 5 min and a fresh request will rebuild on its own if this one fails).
+    snapshots = list(q.get(retry=None))
     bundle.add_named_query("review-events-all", q)
     for snap in snapshots:
         bundle.add_document(snap)
