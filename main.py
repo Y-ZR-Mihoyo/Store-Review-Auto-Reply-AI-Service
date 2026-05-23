@@ -2941,8 +2941,36 @@ def _handle_report_date_range(request):
 BUNDLE_TTL_SEC = _env_int("BUNDLE_TTL_SEC", 300)  # 5 min keeps bundle fresh; <30 min so client gets delta-pricing
 # Cache both raw and gzip-compressed bytes so we don't recompress per request.
 # At 100k+ docs the raw bundle is ~300 MiB and gzips to ~10% of that.
+# Two variants: full (all 30+ fields, used by Reviews-DB which needs review_body
+# for the table) and lite (~18 fields, used by Intelligence/Dashboard pages
+# which only need numeric/categorical fields for KPIs and charts). Lite is
+# ~10x smaller on the wire and ~10x less heap pressure on first paint.
 _BUNDLE_CACHE: Dict[str, Any] = {"bytes": None, "gz": None, "built_at": 0.0, "doc_count": 0}
+_LITE_BUNDLE_CACHE: Dict[str, Any] = {"bytes": None, "gz": None, "built_at": 0.0, "doc_count": 0}
 _BUNDLE_LOCK = threading.Lock()
+_LITE_BUNDLE_LOCK = threading.Lock()
+
+# Fields kept in the lite bundle. Drives a per-doc projection in
+# _build_review_events_bundle() when slim=True. Keep this list aligned with
+# what frontend/src/components/review-intelligence/hooks/* and the executive
+# dashboard actually read — review_body / reply_text / stage*_rationale /
+# stage2_aspects / stage2_key_phrases are intentionally excluded because they
+# are heavy free-text/array fields that the dashboards never group on. Reviews-DB
+# keeps using the full bundle so its table can show review_body and reply_text.
+_LITE_BUNDLE_FIELDS = frozenset({
+    "event_id", "event_type", "rating", "action",
+    "game", "game_biz", "language", "territory",
+    "ingested_at", "review_at",
+    "stage1_bucket", "stage1_confidence",
+    "stage2_issue_type", "stage2_topic", "stage2_confidence",
+    "gate_result", "gate_reason",
+    "template_id",
+    # rating_updated-specific (already small)
+    "old_rating", "rating_delta", "text_changed", "original_found",
+    "original_event_id", "original_action", "original_rating",
+    "original_stage2_issue_type", "original_stage2_topic",
+    "updated_at", "review_id",
+})
 
 
 def _bundle_element(payload: Dict[str, Any]) -> bytes:
@@ -2959,7 +2987,7 @@ def _bundle_element(payload: Dict[str, Any]) -> bytes:
     return f"{len(body)}".encode("ascii") + body
 
 
-def _build_review_events_bundle() -> bytes:
+def _build_review_events_bundle(slim: bool = False) -> bytes:
     """Build a Firestore bundle of the entire review_events collection using REST.
 
     The python-firestore admin SDK trips an internal retry-path bug on Cloud Run
@@ -2976,6 +3004,12 @@ def _build_review_events_bundle() -> bytes:
     JSON encoded as a decimal ASCII string. The FE's loadBundle() parses this
     stream into LocalStore + a named-query registration so subsequent
     onSnapshot(namedQuery) calls only fetch deltas.
+
+    When slim=True, each per-doc payload is projected down to _LITE_BUNDLE_FIELDS
+    before serialization. The named-query name and bundle ID stay the same so
+    the FE's existing namedQuery() lookup works for either variant — but the
+    loaded snapshots will lack the heavy fields (review_body, reply_text, etc.).
+    Use slim only on pages that don't need raw review text.
     """
     _, project = _fs_init_auth()
     token = _fs_get_token()
@@ -3001,8 +3035,11 @@ def _build_review_events_bundle() -> bytes:
         raise RuntimeError(f"runQuery failed http={resp.status_code} body={resp.text[:300]}")
     items = resp.json()  # list of {document: {...}, readTime: "..."} (or {readTime} for empty matches)
 
-    bundle_id = "review-events-bundle"
-    bundle_query_name = "review-events-all"
+    # Distinct bundle IDs and query names per variant. If they shared names, the
+    # FE SDK's local cache would resolve namedQuery() to whichever variant was
+    # loaded last, mixing slim and full doc projections in the same listener.
+    bundle_id = "review-events-bundle-lite" if slim else "review-events-bundle"
+    bundle_query_name = "review-events-all-lite" if slim else "review-events-all"
     create_time = _utc_iso_now()
 
     # Pull a stable read_time from the first item that has one, falling back to
@@ -3054,11 +3091,19 @@ def _build_review_events_bundle() -> bytes:
         body_chunks.append(_bundle_element(doc_meta_el))
 
         # The `document` element is literally the REST runQuery doc shape.
-        # Drop the unused ones so the wire payload is smaller.
+        # For the lite variant, project per-doc `fields` down to the dashboard-
+        # only field whitelist. Heavy fields like review_body, reply_text,
+        # stage1_rationale, stage2_aspects, stage2_key_phrases, stage2_rationale
+        # are dropped — collectively they account for ~90% of bundle bytes.
+        all_fields = doc.get("fields", {})
+        if slim:
+            picked_fields = {k: v for k, v in all_fields.items() if k in _LITE_BUNDLE_FIELDS}
+        else:
+            picked_fields = all_fields
         doc_el = {
             "document": {
                 "name": doc_name,
-                "fields": doc.get("fields", {}),
+                "fields": picked_fields,
                 "createTime": doc.get("createTime"),
                 "updateTime": doc.get("updateTime"),
             }
@@ -3083,32 +3128,34 @@ def _build_review_events_bundle() -> bytes:
     return leading + b"".join(body_chunks)
 
 
-def _handle_review_bundle(request):
-    """GET /review-bundle — serves a Firestore bundle of review_events.
+def _handle_review_bundle(request, slim: bool = False):
+    """GET /review-bundle (or /review-bundle/lite) — serves a Firestore bundle of review_events.
 
-    Cached in-process for BUNDLE_TTL_SEC. Cache-Control allows the CDN / proxies
-    to cache the same TTL so most users hit the edge, never the origin.
+    Cached in-process for BUNDLE_TTL_SEC under one of two caches depending on
+    the slim flag. Cache-Control allows the CDN / proxies to cache the same TTL
+    so most users hit the edge, never the origin.
 
     Returned as a streamed response (chunked transfer-encoding) because Cloud Run
-    caps non-streamed responses at 32 MiB, and the bundle for ~110k docs exceeds
-    that. Streaming has no size cap.
+    caps non-streamed responses at 32 MiB. Streaming has no size cap.
     """
     import gzip as _gzip
     now = time.time()
-    cache = _BUNDLE_CACHE
+    cache = _LITE_BUNDLE_CACHE if slim else _BUNDLE_CACHE
+    lock = _LITE_BUNDLE_LOCK if slim else _BUNDLE_LOCK
+    variant = "lite" if slim else "full"
     if cache["bytes"] is not None and (now - cache["built_at"]) < BUNDLE_TTL_SEC:
         body = cache["bytes"]
         gz_body = cache["gz"]
         age = int(now - cache["built_at"])
     else:
-        with _BUNDLE_LOCK:
+        with lock:
             now = time.time()
             if cache["bytes"] is None or (now - cache["built_at"]) >= BUNDLE_TTL_SEC:
                 build_start = _now_ms()
                 try:
-                    body = _build_review_events_bundle()
+                    body = _build_review_events_bundle(slim=slim)
                 except Exception as e:
-                    _log_event("bundle_build_failed", {"err": str(e)})
+                    _log_event("bundle_build_failed", {"variant": variant, "err": str(e)})
                     return json.dumps({"error": "bundle_build_failed", "detail": str(e)}), 500, JSON_HEADERS
                 build_ms = _now_ms() - build_start
                 # Pre-compress so every served request hits a precomputed buffer.
@@ -3120,6 +3167,7 @@ def _handle_review_bundle(request):
                 cache["built_at"] = now
                 cache["doc_count"] = body.count(b'"documentMetadata"')
                 _log_event("bundle_built", {
+                    "variant": variant,
                     "size_bytes": len(body),
                     "gz_size_bytes": len(gz_body),
                     "build_ms": build_ms,
@@ -3567,9 +3615,14 @@ def review_webhook(request):
     # Route: Firestore bundle for the review_events collection.
     # Public-readable (no auth) so the CDN can cache it cheaply; the data is the same
     # PII-free analytics already exposed via the unauthenticated Firestore rules.
+    # Two variants:
+    #   /review-bundle       — full, ~30 MiB gzipped, used by Reviews-DB which needs review_body.
+    #   /review-bundle/lite  — slim (~3 MiB gzipped), used by Intelligence/Dashboard pages.
     if request.path == "/review-bundle" and request.method == "GET":
-        return _handle_review_bundle(request)
-    if request.path == "/review-bundle" and request.method == "OPTIONS":
+        return _handle_review_bundle(request, slim=False)
+    if request.path == "/review-bundle/lite" and request.method == "GET":
+        return _handle_review_bundle(request, slim=True)
+    if request.path in ("/review-bundle", "/review-bundle/lite") and request.method == "OPTIONS":
         # CORS preflight
         return "", 204, {
             "Access-Control-Allow-Origin": "*",
