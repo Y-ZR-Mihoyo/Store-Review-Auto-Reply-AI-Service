@@ -2926,6 +2926,101 @@ def _handle_report_date_range(request):
 
 
 # -----------------------------
+# Firestore bundle endpoints
+# -----------------------------
+# Bundles let the FE load the entire `review_events` collection (~110k+ docs and growing)
+# in a single CDN-cached payload, then attach a normal onSnapshot to the named query
+# inside the bundle to receive only deltas after the bundle's snapshot version. This is
+# the official Firebase pattern for "show all + live updates" on large collections —
+# https://firebase.google.com/docs/firestore/bundles
+#
+# We build the bundle in-process and cache the bytes for BUNDLE_TTL_SEC. Every request
+# within the TTL is served from memory in microseconds; once the TTL lapses, the next
+# request rebuilds. Cache-Control headers also let upstream proxies / Cloud CDN cache.
+
+BUNDLE_TTL_SEC = _env_int("BUNDLE_TTL_SEC", 300)  # 5 min keeps bundle fresh; <30 min so client gets delta-pricing
+_BUNDLE_CACHE: Dict[str, Any] = {"bytes": None, "built_at": 0.0, "doc_count": 0}
+_BUNDLE_LOCK = threading.Lock()
+
+
+def _build_review_events_bundle() -> bytes:
+    """Build a Firestore bundle containing the entire review_events collection.
+
+    Uses the Python admin SDK (google-cloud-firestore) to materialize a full
+    snapshot + a named query the FE can subscribe to. Heavy operation (~few seconds
+    at 100k docs); caller is responsible for caching.
+    """
+    from google.cloud import firestore as gcf
+    from google.cloud.firestore_bundle import FirestoreBundle
+
+    client = gcf.Client(project=_project_id(), database=FIRESTORE_DATABASE)
+    bundle = FirestoreBundle("review-events-bundle")
+
+    # Named query the FE will subscribe to via namedQuery(db, 'review-events-all').
+    coll = client.collection(FIRESTORE_COLLECTION)
+    q = coll.order_by("ingested_at", direction=gcf.Query.DESCENDING)
+
+    # Materialize the snapshot once and reuse for both the named-query registration
+    # and the per-doc adds. add_named_query takes the query (no docs needed); we
+    # then add each DocumentSnapshot we already fetched.
+    snapshots = list(q.stream())
+    bundle.add_named_query("review-events-all", q)
+    for snap in snapshots:
+        bundle.add_document(snap)
+
+    return bundle.build().encode("utf-8")
+
+
+def _handle_review_bundle(request):
+    """GET /review-bundle — serves a Firestore bundle of review_events.
+
+    Cached in-process for BUNDLE_TTL_SEC. Cache-Control allows the CDN / proxies
+    to cache the same TTL so most users hit the edge, never the origin.
+    """
+    now = time.time()
+    cache = _BUNDLE_CACHE
+    if cache["bytes"] is not None and (now - cache["built_at"]) < BUNDLE_TTL_SEC:
+        body = cache["bytes"]
+        age = int(now - cache["built_at"])
+    else:
+        with _BUNDLE_LOCK:
+            # Double-check under lock — another request may have rebuilt while we waited.
+            now = time.time()
+            if cache["bytes"] is None or (now - cache["built_at"]) >= BUNDLE_TTL_SEC:
+                build_start = _now_ms()
+                try:
+                    body = _build_review_events_bundle()
+                except Exception as e:
+                    _log_event("bundle_build_failed", {"err": str(e)})
+                    return json.dumps({"error": "bundle_build_failed", "detail": str(e)}), 500, JSON_HEADERS
+                build_ms = _now_ms() - build_start
+                cache["bytes"] = body
+                cache["built_at"] = now
+                cache["doc_count"] = body.count(b'"documentMetadata"')  # rough sanity log
+                _log_event("bundle_built", {
+                    "size_bytes": len(body),
+                    "build_ms": build_ms,
+                })
+            else:
+                body = cache["bytes"]
+        age = int(now - cache["built_at"])
+
+    headers = {
+        # Bundles are gzip-compressible binary protobuf serialized as a JSON-ish
+        # length-prefixed stream. Application/octet-stream is what the FE SDK expects.
+        "Content-Type": "application/octet-stream",
+        # Cache for the rest of the bundle's TTL so the CDN doesn't re-fetch.
+        "Cache-Control": f"public, max-age={max(1, BUNDLE_TTL_SEC - age)}, s-maxage={max(1, BUNDLE_TTL_SEC - age)}",
+        "X-Bundle-Age-Sec": str(age),
+        "X-Bundle-TTL-Sec": str(BUNDLE_TTL_SEC),
+        # CORS so the FE can fetch from the same CDN host.
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": WEBHOOK_HEADER,
+    }
+    return body, 200, headers
+
+
+# -----------------------------
 # Async helpers
 # -----------------------------
 def _enqueue_review_task(event_id: str, payload: Dict[str, Any]) -> bool:
@@ -3323,6 +3418,20 @@ def review_webhook(request):
             if not secrets.compare_digest(got, WEBHOOK_TOKEN):
                 _log_event("tool_auth_failed", {"path": request.path})
                 return "unauthorized", 401
+
+    # Route: Firestore bundle for the review_events collection.
+    # Public-readable (no auth) so the CDN can cache it cheaply; the data is the same
+    # PII-free analytics already exposed via the unauthenticated Firestore rules.
+    if request.path == "/review-bundle" and request.method == "GET":
+        return _handle_review_bundle(request)
+    if request.path == "/review-bundle" and request.method == "OPTIONS":
+        # CORS preflight
+        return "", 204, {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": WEBHOOK_HEADER,
+            "Access-Control-Allow-Methods": "GET, OPTIONS",
+            "Access-Control-Max-Age": "86400",
+        }
 
     # Route: on-demand topic sub-issue analysis
     if request.path == "/analyze-topic" and request.method == "POST":
