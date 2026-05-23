@@ -3246,6 +3246,10 @@ _DASHBOARD_EVENTS_LOCK = threading.Lock()
 
 # Fields kept per row in the dashboard-events JSON. Each row is a flat object;
 # the FE adapter (use-intelligence-data) maps it to the existing TestCase shape.
+# review_body and stage2_key_phrases are heavier than the other fields but the
+# Analysis page genuinely needs them (sample-review snippets per topic, top
+# key-phrase frequencies). review_body is truncated server-side to keep the
+# wire payload bounded (see _DASHBOARD_REVIEW_BODY_MAX_CHARS).
 _DASHBOARD_EVENT_FIELDS = (
     "event_id",
     "rating",
@@ -3259,10 +3263,18 @@ _DASHBOARD_EVENT_FIELDS = (
     "stage2_issue_type",
     "stage2_topic",
     "stage2_confidence",
+    "stage2_key_phrases",
     "gate_result",
     "gate_reason",
     "template_id",
+    "review_body",
 )
+
+# Hard cap on review_body length per row. The Analysis page only uses up to
+# 200 chars in its sample-review display (see use-analysis-metrics.ts L170-172
+# truncating to "...substring(0, 150) + '...'"), so 200 is plenty. Keeping the
+# cap on the server avoids shipping a few thousand-char outliers.
+_DASHBOARD_REVIEW_BODY_MAX_CHARS = 200
 
 
 def _build_dashboard_events_payload() -> bytes:
@@ -3312,7 +3324,12 @@ def _build_dashboard_events_payload() -> bytes:
             v = fields.get(k)
             if v is None:
                 continue
-            row[k] = _fs_parse_value(v)
+            parsed = _fs_parse_value(v)
+            # Truncate review_body server-side to keep the JSON wire payload
+            # bounded; the Analysis page never displays more than ~200 chars.
+            if k == "review_body" and isinstance(parsed, str) and len(parsed) > _DASHBOARD_REVIEW_BODY_MAX_CHARS:
+                parsed = parsed[:_DASHBOARD_REVIEW_BODY_MAX_CHARS]
+            row[k] = parsed
         rows.append(row)
 
     return json.dumps(rows, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
