@@ -3223,6 +3223,170 @@ def _handle_review_bundle(request, slim: bool = False):
 
 
 # -----------------------------
+# Dashboard events: tiny JSON array for FE-side aggregation
+# -----------------------------
+# The Firestore bundles approach (full + lite) ships docs through Firestore's
+# IndexedDB hydration path, which takes 30-60 seconds even for the slim 113k-doc
+# variant — the local-cache write-on-main-thread is the bottleneck, not the
+# wire transfer.
+#
+# This endpoint sidesteps Firestore entirely. It returns a plain JSON array of
+# the events with only the fields the FE Intelligence/Dashboard hooks consume,
+# stripped to ~10-12 fields per row. At ~50 bytes/row gzipped, 113k rows ≈
+# 700 KiB on the wire and ~10 MiB JS heap — small enough to parse + aggregate
+# in <1 s. No Firestore SDK, no IndexedDB, no bundle parsing.
+#
+# The FE consumes this via fetchDashboardEvents() and feeds the existing
+# useMonitoringMetrics / useAnalysisMetrics / useOpsMetrics hooks unchanged
+# (they already aggregate from a list).
+
+DASHBOARD_EVENTS_TTL_SEC = _env_int("DASHBOARD_EVENTS_TTL_SEC", 300)
+_DASHBOARD_EVENTS_CACHE: Dict[str, Any] = {"bytes": None, "gz": None, "built_at": 0.0, "doc_count": 0}
+_DASHBOARD_EVENTS_LOCK = threading.Lock()
+
+# Fields kept per row in the dashboard-events JSON. Each row is a flat object;
+# the FE adapter (use-intelligence-data) maps it to the existing TestCase shape.
+_DASHBOARD_EVENT_FIELDS = (
+    "event_id",
+    "rating",
+    "action",
+    "game",
+    "game_biz",
+    "language",
+    "ingested_at",
+    "stage1_bucket",
+    "stage1_confidence",
+    "stage2_issue_type",
+    "stage2_topic",
+    "stage2_confidence",
+    "gate_result",
+    "gate_reason",
+    "template_id",
+)
+
+
+def _build_dashboard_events_payload() -> bytes:
+    """Build the JSON array used by the FE Intelligence/Dashboard pages.
+
+    Streams every doc out of Firestore via REST :runQuery (the same path the
+    bundle build uses), projects each doc to the dashboard-only field set, and
+    serialises to a single compact JSON array. Skips docs without an
+    `evt_gp_` event_id so the dashboards don't see test/sim records.
+    """
+    _, project = _fs_init_auth()
+    token = _fs_get_token()
+    base_path = f"https://firestore.googleapis.com/v1/projects/{project}/databases/{FIRESTORE_DATABASE}/documents"
+    url = f"{base_path}:runQuery"
+
+    query_body = {
+        "structuredQuery": {
+            "from": [{"collectionId": FIRESTORE_COLLECTION}],
+            "orderBy": [{"field": {"fieldPath": "ingested_at"}, "direction": "DESCENDING"}],
+        }
+    }
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json; charset=utf-8",
+    }
+    resp = _HTTP.post(url, headers=headers, data=json.dumps(query_body), timeout=300)
+    if resp.status_code != 200:
+        raise RuntimeError(f"runQuery failed http={resp.status_code} body={resp.text[:300]}")
+    items = resp.json()
+
+    # Build the list incrementally and json.dumps once at the end. Iterative
+    # serialisation would be marginally faster but the bottleneck is REST
+    # parsing, not JSON output.
+    rows: List[Dict[str, Any]] = []
+    for item in items:
+        doc = item.get("document")
+        if not doc:
+            continue
+        fields = doc.get("fields", {})
+        # Only ingest real CSC events; the same filter the report endpoint uses.
+        eid_raw = fields.get("event_id", {})
+        eid = eid_raw.get("stringValue") if isinstance(eid_raw, dict) else None
+        if not eid or not eid.startswith("evt_gp_"):
+            continue
+        row: Dict[str, Any] = {}
+        for k in _DASHBOARD_EVENT_FIELDS:
+            v = fields.get(k)
+            if v is None:
+                continue
+            row[k] = _fs_parse_value(v)
+        rows.append(row)
+
+    return json.dumps(rows, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _handle_dashboard_events(request):
+    """GET /dashboard-events — tiny JSON array of every event for FE aggregation.
+
+    Cached in-process for DASHBOARD_EVENTS_TTL_SEC (5 min). Cache-Control
+    propagates to the CDN so most clients hit the edge.
+    """
+    import gzip as _gzip
+    now = time.time()
+    cache = _DASHBOARD_EVENTS_CACHE
+    if cache["bytes"] is not None and (now - cache["built_at"]) < DASHBOARD_EVENTS_TTL_SEC:
+        body = cache["bytes"]
+        gz_body = cache["gz"]
+        age = int(now - cache["built_at"])
+    else:
+        with _DASHBOARD_EVENTS_LOCK:
+            now = time.time()
+            if cache["bytes"] is None or (now - cache["built_at"]) >= DASHBOARD_EVENTS_TTL_SEC:
+                build_start = _now_ms()
+                try:
+                    body = _build_dashboard_events_payload()
+                except Exception as e:
+                    _log_event("dashboard_events_build_failed", {"err": str(e)})
+                    return json.dumps({"error": "build_failed", "detail": str(e)}), 500, JSON_HEADERS
+                build_ms = _now_ms() - build_start
+                gz_body = _gzip.compress(body, compresslevel=6)
+                cache["bytes"] = body
+                cache["gz"] = gz_body
+                cache["built_at"] = now
+                # Doc count: the JSON array has one '{' per row.
+                cache["doc_count"] = body.count(b'":')  # rough sanity; logged only
+                _log_event("dashboard_events_built", {
+                    "size_bytes": len(body),
+                    "gz_size_bytes": len(gz_body),
+                    "build_ms": build_ms,
+                })
+            else:
+                body = cache["bytes"]
+                gz_body = cache["gz"]
+        age = int(now - cache["built_at"])
+
+    accept_encoding = (request.headers.get("Accept-Encoding") or "").lower()
+    use_gzip = "gzip" in accept_encoding and gz_body is not None
+    payload = gz_body if use_gzip else body
+
+    headers = {
+        "Content-Type": "application/json; charset=utf-8",
+        "Cache-Control": f"public, max-age={max(1, DASHBOARD_EVENTS_TTL_SEC - age)}, s-maxage={max(1, DASHBOARD_EVENTS_TTL_SEC - age)}",
+        "X-Cache-Age-Sec": str(age),
+        "X-Cache-TTL-Sec": str(DASHBOARD_EVENTS_TTL_SEC),
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": WEBHOOK_HEADER,
+        "Vary": "Accept-Encoding",
+    }
+    if use_gzip:
+        headers["Content-Encoding"] = "gzip"
+
+    def _gen():
+        chunk_size = 256 * 1024
+        for i in range(0, len(payload), chunk_size):
+            yield payload[i:i + chunk_size]
+
+    from flask import Response as _FlaskResponse
+    resp = _FlaskResponse(_gen(), status=200)
+    for k, v in headers.items():
+        resp.headers[k] = v
+    return resp
+
+
+# -----------------------------
 # Async helpers
 # -----------------------------
 def _enqueue_review_task(event_id: str, payload: Dict[str, Any]) -> bool:
@@ -3633,6 +3797,19 @@ def review_webhook(request):
         return _handle_review_bundle(request, slim=True)
     if request.path in ("/review-bundle", "/review-bundle/lite") and request.method == "OPTIONS":
         # CORS preflight
+        return "", 204, {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": WEBHOOK_HEADER,
+            "Access-Control-Allow-Methods": "GET, OPTIONS",
+            "Access-Control-Max-Age": "86400",
+        }
+
+    # Route: dashboard-events JSON for Intelligence/Dashboard aggregation.
+    # Public-readable like the bundle routes; same data already exposed via
+    # the unauthenticated Firestore rules.
+    if request.path == "/dashboard-events" and request.method == "GET":
+        return _handle_dashboard_events(request)
+    if request.path == "/dashboard-events" and request.method == "OPTIONS":
         return "", 204, {
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Headers": WEBHOOK_HEADER,
