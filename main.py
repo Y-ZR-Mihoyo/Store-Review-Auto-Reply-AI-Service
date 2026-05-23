@@ -3040,6 +3040,13 @@ def _build_review_events_bundle(slim: bool = False) -> bytes:
     # loaded last, mixing slim and full doc projections in the same listener.
     bundle_id = "review-events-bundle-lite" if slim else "review-events-bundle"
     bundle_query_name = "review-events-all-lite" if slim else "review-events-all"
+    # Per the Firestore BundledQuery proto, `parent` must be a Firestore resource
+    # path (projects/.../databases/.../documents), not a friendly name. The SDK's
+    # fromName() validation (hardAssert 0x27ce) fails on the latter — but only
+    # for *new* bundle IDs, not when re-loading the same bundle ID with the same
+    # invalid value already cached, which is why the legacy review-events-bundle
+    # appeared to work earlier. Use the proper path going forward.
+    bundle_parent = f"projects/{project}/databases/{FIRESTORE_DATABASE}/documents"
     create_time = _utc_iso_now()
 
     # Pull a stable read_time from the first item that has one, falling back to
@@ -3058,12 +3065,14 @@ def _build_review_events_bundle(slim: bool = False) -> bytes:
     body_chunks: list[bytes] = []
 
     # 1) namedQuery element. The bundledQuery is the structuredQuery the FE will
-    # re-run live via onSnapshot(namedQuery(db, name)).
+    # re-run live via onSnapshot(namedQuery(db, name)). `parent` is the resource
+    # path the structuredQuery resolves against (collection group lookups join
+    # `from[].collectionId` to this prefix).
     named_query_el = {
         "namedQuery": {
             "name": bundle_query_name,
             "bundledQuery": {
-                "parent": bundle_query_name,
+                "parent": bundle_parent,
                 "structuredQuery": query_body["structuredQuery"],
             },
             "readTime": read_time,
