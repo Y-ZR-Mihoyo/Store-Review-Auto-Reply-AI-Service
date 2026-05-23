@@ -2943,41 +2943,142 @@ _BUNDLE_CACHE: Dict[str, Any] = {"bytes": None, "built_at": 0.0, "doc_count": 0}
 _BUNDLE_LOCK = threading.Lock()
 
 
-def _build_review_events_bundle() -> bytes:
-    """Build a Firestore bundle containing the entire review_events collection.
+def _bundle_element(payload: Dict[str, Any]) -> bytes:
+    """Encode one BundleElement: <length-as-decimal-string><json-bytes>.
 
-    Uses the Python admin SDK (google-cloud-firestore) to materialize a full
-    snapshot + a named query the FE can subscribe to. Heavy operation (~tens of
-    seconds at 100k+ docs); caller is responsible for caching.
-
-    Implementation note: the SDK's Query.stream() trips an internal retry-path
-    bug on Cloud Run ('_UnaryStreamMultiCallable' has no attribute '_retry')
-    when fetching very large result sets. Query.get() goes through a different
-    code path that doesn't have this issue, and is fine here because we have to
-    materialize all docs into memory anyway to add them to the bundle.
+    The Firestore bundle wire format is a concatenation of length-prefixed JSON
+    objects, each representing exactly one BundleElement (metadata, namedQuery,
+    documentMetadata, or document). The SDK builds this with json_format on the
+    proto; for our REST-based path we craft the JSON directly. The serialized
+    layout matches the spec at
+    https://github.com/firebase/firebase-js-sdk/blob/main/packages/firestore/src/util/bundle_reader.ts
     """
-    from google.cloud import firestore as gcf
-    from google.cloud.firestore_bundle import FirestoreBundle
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return f"{len(body)}".encode("ascii") + body
 
-    client = gcf.Client(project=_project_id(), database=FIRESTORE_DATABASE)
-    bundle = FirestoreBundle("review-events-bundle")
 
-    coll = client.collection(FIRESTORE_COLLECTION)
-    q = coll.order_by("ingested_at", direction=gcf.Query.DESCENDING)
+def _build_review_events_bundle() -> bytes:
+    """Build a Firestore bundle of the entire review_events collection using REST.
 
-    # On Cloud Run, the SDK's default retry path crashes with
-    # "'_UnaryStreamMultiCallable' object has no attribute '_retry'" when the
-    # gapic stub was created without the retry decoration the firestore Query
-    # code expects. Passing retry=None bypasses the retry lookup entirely; the
-    # underlying gRPC call still has its own transport-level retries, so giving
-    # up the application-level retry is acceptable here (we cache the bundle
-    # for 5 min and a fresh request will rebuild on its own if this one fails).
-    snapshots = list(q.get(retry=None))
-    bundle.add_named_query("review-events-all", q)
-    for snap in snapshots:
-        bundle.add_document(snap)
+    The python-firestore admin SDK trips an internal retry-path bug on Cloud Run
+    ('_UnaryStreamMultiCallable' has no attribute '_retry'), and chasing the
+    matrix of api-core / grpcio versions that work isn't worth it. Instead we
+    construct the bundle byte-for-byte from REST :runQuery responses, which is
+    the same code path the rest of this service already uses for Firestore.
 
-    return bundle.build().encode("utf-8")
+    The bundle layout is:
+        metadata        — totals, schema version
+        namedQuery      — describes the query (review-events-all)
+        documentMetadata + document  — for every doc, two elements
+    Each element is `<length><json>` where length is the byte length of the
+    JSON encoded as a decimal ASCII string. The FE's loadBundle() parses this
+    stream into LocalStore + a named-query registration so subsequent
+    onSnapshot(namedQuery) calls only fetch deltas.
+    """
+    _, project = _fs_init_auth()
+    token = _fs_get_token()
+    base = f"https://firestore.googleapis.com/v1/projects/{project}/databases/{FIRESTORE_DATABASE}/documents"
+    url = f"{base}:runQuery"
+
+    query_body = {
+        "structuredQuery": {
+            "from": [{"collectionId": FIRESTORE_COLLECTION}],
+            "orderBy": [{"field": {"fieldPath": "ingested_at"}, "direction": "DESCENDING"}],
+        }
+    }
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json; charset=utf-8",
+    }
+    # Stream the REST response so we don't buffer ~150 MiB of JSON twice. The
+    # raw response is one giant JSON array; ijson would be ideal but the std
+    # lib parser is fine here because Firestore returns docs in chunks separated
+    # by newlines via x-goog-streaming once we pass the right Accept hint.
+    resp = _HTTP.post(url, headers=headers, data=json.dumps(query_body), timeout=300)
+    if resp.status_code != 200:
+        raise RuntimeError(f"runQuery failed http={resp.status_code} body={resp.text[:300]}")
+    items = resp.json()  # list of {document: {...}, readTime: "..."} (or {readTime} for empty matches)
+
+    bundle_id = "review-events-bundle"
+    bundle_query_name = "review-events-all"
+    create_time = _utc_iso_now()
+
+    # Pull a stable read_time from the first item that has one, falling back to
+    # the build wall-clock if every item is empty.
+    read_time: str = create_time
+    for item in items:
+        if item.get("readTime"):
+            read_time = item["readTime"]
+            break
+
+    # Pre-render every document and document_metadata element so we can compute
+    # the total byte count for the leading `metadata` element. The bundle spec
+    # requires `metadata` to come FIRST and lists totalBytes / totalDocuments,
+    # but those numbers are advisory — the FE doesn't crash on a mismatch — so
+    # we set totalBytes to the sum of subsequent element bytes.
+    body_chunks: list[bytes] = []
+
+    # 1) namedQuery element. The bundledQuery is the structuredQuery the FE will
+    # re-run live via onSnapshot(namedQuery(db, name)).
+    named_query_el = {
+        "namedQuery": {
+            "name": bundle_query_name,
+            "bundledQuery": {
+                "parent": bundle_query_name,
+                "structuredQuery": query_body["structuredQuery"],
+            },
+            "readTime": read_time,
+        }
+    }
+    body_chunks.append(_bundle_element(named_query_el))
+
+    # 2) per-document elements. Skip items with no document (empty-match rows).
+    doc_count = 0
+    for item in items:
+        doc = item.get("document")
+        if not doc:
+            continue
+        doc_name = doc.get("name", "")
+        if not doc_name:
+            continue
+        doc_meta_el = {
+            "documentMetadata": {
+                "name": doc_name,
+                "readTime": item.get("readTime", read_time),
+                "exists": True,
+                "queries": [bundle_query_name],
+            }
+        }
+        body_chunks.append(_bundle_element(doc_meta_el))
+
+        # The `document` element is literally the REST runQuery doc shape.
+        # Drop the unused ones so the wire payload is smaller.
+        doc_el = {
+            "document": {
+                "name": doc_name,
+                "fields": doc.get("fields", {}),
+                "createTime": doc.get("createTime"),
+                "updateTime": doc.get("updateTime"),
+            }
+        }
+        body_chunks.append(_bundle_element(doc_el))
+        doc_count += 1
+
+    body_total_bytes = sum(len(c) for c in body_chunks)
+
+    # 3) leading metadata element. Compose last so we know the totals.
+    metadata_el = {
+        "metadata": {
+            "id": bundle_id,
+            "createTime": create_time,
+            "version": 1,
+            "totalDocuments": doc_count,
+            "totalBytes": str(body_total_bytes),
+        }
+    }
+    leading = _bundle_element(metadata_el)
+
+    return leading + b"".join(body_chunks)
 
 
 def _handle_review_bundle(request):
