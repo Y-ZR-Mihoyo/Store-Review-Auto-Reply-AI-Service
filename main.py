@@ -2939,7 +2939,9 @@ def _handle_report_date_range(request):
 # request rebuilds. Cache-Control headers also let upstream proxies / Cloud CDN cache.
 
 BUNDLE_TTL_SEC = _env_int("BUNDLE_TTL_SEC", 300)  # 5 min keeps bundle fresh; <30 min so client gets delta-pricing
-_BUNDLE_CACHE: Dict[str, Any] = {"bytes": None, "built_at": 0.0, "doc_count": 0}
+# Cache both raw and gzip-compressed bytes so we don't recompress per request.
+# At 100k+ docs the raw bundle is ~300 MiB and gzips to ~10% of that.
+_BUNDLE_CACHE: Dict[str, Any] = {"bytes": None, "gz": None, "built_at": 0.0, "doc_count": 0}
 _BUNDLE_LOCK = threading.Lock()
 
 
@@ -3091,10 +3093,12 @@ def _handle_review_bundle(request):
     caps non-streamed responses at 32 MiB, and the bundle for ~110k docs exceeds
     that. Streaming has no size cap.
     """
+    import gzip as _gzip
     now = time.time()
     cache = _BUNDLE_CACHE
     if cache["bytes"] is not None and (now - cache["built_at"]) < BUNDLE_TTL_SEC:
         body = cache["bytes"]
+        gz_body = cache["gz"]
         age = int(now - cache["built_at"])
     else:
         with _BUNDLE_LOCK:
@@ -3107,16 +3111,28 @@ def _handle_review_bundle(request):
                     _log_event("bundle_build_failed", {"err": str(e)})
                     return json.dumps({"error": "bundle_build_failed", "detail": str(e)}), 500, JSON_HEADERS
                 build_ms = _now_ms() - build_start
+                # Pre-compress so every served request hits a precomputed buffer.
+                # Compression level 6 is the gzip default and keeps build time
+                # in the few-second range even at ~300 MiB of input.
+                gz_body = _gzip.compress(body, compresslevel=6)
                 cache["bytes"] = body
+                cache["gz"] = gz_body
                 cache["built_at"] = now
                 cache["doc_count"] = body.count(b'"documentMetadata"')
                 _log_event("bundle_built", {
                     "size_bytes": len(body),
+                    "gz_size_bytes": len(gz_body),
                     "build_ms": build_ms,
                 })
             else:
                 body = cache["bytes"]
+                gz_body = cache["gz"]
         age = int(now - cache["built_at"])
+
+    # Pick gzipped variant when the client supports it (every modern browser does).
+    accept_encoding = (request.headers.get("Accept-Encoding") or "").lower()
+    use_gzip = "gzip" in accept_encoding and gz_body is not None
+    payload = gz_body if use_gzip else body
 
     headers = {
         # The Firestore bundle format is a length-prefixed JSON stream. Browsers
@@ -3128,15 +3144,19 @@ def _handle_review_bundle(request):
         "X-Bundle-TTL-Sec": str(BUNDLE_TTL_SEC),
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Headers": WEBHOOK_HEADER,
+        # Vary on Accept-Encoding so caches keep gzip and identity copies separate.
+        "Vary": "Accept-Encoding",
     }
+    if use_gzip:
+        headers["Content-Encoding"] = "gzip"
 
     # Stream in 256 KiB chunks so the response doesn't tip over Cloud Run's
     # non-streamed body size limit. Flask detects a generator return and wraps
     # the response in chunked transfer-encoding automatically.
     def _gen():
         chunk_size = 256 * 1024
-        for i in range(0, len(body), chunk_size):
-            yield body[i:i + chunk_size]
+        for i in range(0, len(payload), chunk_size):
+            yield payload[i:i + chunk_size]
 
     from flask import Response as _FlaskResponse
     resp = _FlaskResponse(_gen(), status=200)
