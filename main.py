@@ -2976,6 +2976,10 @@ def _handle_review_bundle(request):
 
     Cached in-process for BUNDLE_TTL_SEC. Cache-Control allows the CDN / proxies
     to cache the same TTL so most users hit the edge, never the origin.
+
+    Returned as a streamed response (chunked transfer-encoding) because Cloud Run
+    caps non-streamed responses at 32 MiB, and the bundle for ~110k docs exceeds
+    that. Streaming has no size cap.
     """
     now = time.time()
     cache = _BUNDLE_CACHE
@@ -2984,7 +2988,6 @@ def _handle_review_bundle(request):
         age = int(now - cache["built_at"])
     else:
         with _BUNDLE_LOCK:
-            # Double-check under lock — another request may have rebuilt while we waited.
             now = time.time()
             if cache["bytes"] is None or (now - cache["built_at"]) >= BUNDLE_TTL_SEC:
                 build_start = _now_ms()
@@ -2996,7 +2999,7 @@ def _handle_review_bundle(request):
                 build_ms = _now_ms() - build_start
                 cache["bytes"] = body
                 cache["built_at"] = now
-                cache["doc_count"] = body.count(b'"documentMetadata"')  # rough sanity log
+                cache["doc_count"] = body.count(b'"documentMetadata"')
                 _log_event("bundle_built", {
                     "size_bytes": len(body),
                     "build_ms": build_ms,
@@ -3006,18 +3009,30 @@ def _handle_review_bundle(request):
         age = int(now - cache["built_at"])
 
     headers = {
-        # Bundles are gzip-compressible binary protobuf serialized as a JSON-ish
-        # length-prefixed stream. Application/octet-stream is what the FE SDK expects.
+        # The Firestore bundle format is a length-prefixed JSON stream. Browsers
+        # treat application/octet-stream as opaque bytes, which matches what
+        # loadBundle() expects to receive.
         "Content-Type": "application/octet-stream",
-        # Cache for the rest of the bundle's TTL so the CDN doesn't re-fetch.
         "Cache-Control": f"public, max-age={max(1, BUNDLE_TTL_SEC - age)}, s-maxage={max(1, BUNDLE_TTL_SEC - age)}",
         "X-Bundle-Age-Sec": str(age),
         "X-Bundle-TTL-Sec": str(BUNDLE_TTL_SEC),
-        # CORS so the FE can fetch from the same CDN host.
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Headers": WEBHOOK_HEADER,
     }
-    return body, 200, headers
+
+    # Stream in 256 KiB chunks so the response doesn't tip over Cloud Run's
+    # non-streamed body size limit. Flask detects a generator return and wraps
+    # the response in chunked transfer-encoding automatically.
+    def _gen():
+        chunk_size = 256 * 1024
+        for i in range(0, len(body), chunk_size):
+            yield body[i:i + chunk_size]
+
+    from flask import Response as _FlaskResponse
+    resp = _FlaskResponse(_gen(), status=200)
+    for k, v in headers.items():
+        resp.headers[k] = v
+    return resp
 
 
 # -----------------------------
