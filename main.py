@@ -1557,7 +1557,12 @@ def _handle_rating_updated(payload: Dict[str, Any]) -> Tuple[str, int, Dict[str,
 # -----------------------------
 TOPIC_ANALYSIS_COLLECTION = "topic_analysis"
 TOPIC_ANALYSIS_CACHE_TTL_SEC = 24 * 60 * 60  # 24 hours
-TOPIC_ANALYSIS_MAX_REVIEWS = 100
+TOPIC_ANALYSIS_MAX_REVIEWS = 500
+# Cap on the full-collection scan for sub-issue counting. The biggest topic
+# ("恶意差评 Malicious Low Score") is ~40k docs; this is generous headroom.
+TOPIC_COUNT_SCAN_MAX = 100_000
+# Page size for the count scan. Each doc is ~500 bytes wire, so 5k pages = ~2.5 MB.
+TOPIC_COUNT_SCAN_PAGE = 5_000
 
 
 def _topic_cache_key(topic: str, game: Optional[str], language: Optional[str]) -> str:
@@ -2111,6 +2116,12 @@ RULES:
 5. Name sub-issues in English, clearly and specifically (e.g., "Crashes during co-op gameplay" not "Crash issues").
 6. Order by count descending.
 7. Write a 1-2 sentence summary of the overall pattern.
+8. For each sub-issue, list 5-10 evidence_phrases — short distinctive substrings (3-30 chars) that
+   appear verbatim in reviews of that sub-issue. Phrases will be used as case-insensitive substring
+   matches to count occurrences across the FULL collection (not just this sample), so:
+   - Include phrases in EVERY language seen for that sub-issue (multilingual coverage matters).
+   - Prefer specific, distinctive phrases over generic words ("greedy company" beats "bad").
+   - Do NOT include the topic name itself or full sentences.
 
 REVIEWS ({n} total, topic: "{topic}"):
 {reviews_block}
@@ -2138,13 +2149,130 @@ TOPIC_ANALYSIS_SCHEMA = {
                         "type": "ARRAY",
                         "items": {"type": "STRING"},
                     },
+                    "evidence_phrases": {
+                        "type": "ARRAY",
+                        "items": {"type": "STRING"},
+                    },
                 },
-                "required": ["name", "count", "percentage", "representative_quotes", "languages_seen"],
+                "required": ["name", "count", "percentage", "representative_quotes", "languages_seen", "evidence_phrases"],
             },
         },
     },
     "required": ["summary", "sub_issues"],
 }
+
+
+def _fs_count_reviews_matching_phrases(
+    topic: str,
+    game: Optional[str],
+    language: Optional[str],
+    sub_issues: List[Dict[str, Any]],
+) -> Tuple[List[int], int]:
+    """Scan ALL review_events matching (topic, game?, language?) and count, for each
+    sub-issue, how many reviews contain at least one of its evidence_phrases as a
+    case-insensitive substring. Returns (per_sub_issue_counts, total_topic_count).
+
+    Only the first phrase a review matches counts for that review (so a review is
+    attributed to at most one sub-issue, biased toward earlier sub-issues which the
+    LLM already returned in count-descending order).
+    """
+    if not FIRESTORE_ENABLED:
+        return [0] * len(sub_issues), 0
+
+    # Pre-lowercase phrases per sub-issue, drop empties, dedupe.
+    norm_phrases: List[List[str]] = []
+    for s in sub_issues:
+        seen: set = set()
+        out: List[str] = []
+        for p in s.get("evidence_phrases", []) or []:
+            p = (p or "").strip().lower()
+            if p and len(p) >= 2 and p not in seen:
+                seen.add(p)
+                out.append(p)
+        norm_phrases.append(out)
+
+    counts = [0] * len(sub_issues)
+    total = 0
+
+    _, project = _fs_init_auth()
+    token = _fs_get_token()
+    base = f"https://firestore.googleapis.com/v1/projects/{project}/databases/{FIRESTORE_DATABASE}/documents"
+    url = f"{base}:runQuery"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json; charset=utf-8",
+    }
+
+    # The cursor is on event_id since we're already filtering by an event_id range
+    # ("evt_gp_" prefix). Paginating by event_id is stable and matches the index we
+    # already have for this query.
+    cursor_event_id = "evt_gp_"
+    scanned = 0
+
+    while scanned < TOPIC_COUNT_SCAN_MAX:
+        field_filters = [
+            {"fieldFilter": {"field": {"fieldPath": "stage2_topic"}, "op": "EQUAL", "value": {"stringValue": topic}}},
+            {"fieldFilter": {"field": {"fieldPath": "event_id"}, "op": "GREATER_THAN_OR_EQUAL", "value": {"stringValue": cursor_event_id}}},
+            {"fieldFilter": {"field": {"fieldPath": "event_id"}, "op": "LESS_THAN", "value": {"stringValue": "evt_gp`"}}},
+        ]
+        if game:
+            field_filters.append({"fieldFilter": {"field": {"fieldPath": "game"}, "op": "EQUAL", "value": {"stringValue": game}}})
+        if language:
+            field_filters.append({"fieldFilter": {"field": {"fieldPath": "language"}, "op": "EQUAL", "value": {"stringValue": language}}})
+
+        query_body = {
+            "structuredQuery": {
+                "from": [{"collectionId": FIRESTORE_COLLECTION}],
+                "where": {"compositeFilter": {"op": "AND", "filters": field_filters}},
+                "orderBy": [{"field": {"fieldPath": "event_id"}, "direction": "ASCENDING"}],
+                "limit": TOPIC_COUNT_SCAN_PAGE,
+            }
+        }
+
+        resp = _HTTP.post(url, headers=headers, data=json.dumps(query_body), timeout=30)
+        resp.raise_for_status()
+
+        page_count = 0
+        last_event_id = cursor_event_id
+        # If the previous cursor sat at a doc boundary, that doc was already counted
+        # last page; skip it on the first row of the new page.
+        first_row_in_page = True
+
+        for item in resp.json():
+            doc = item.get("document")
+            if not doc:
+                continue
+            page_count += 1
+            fields = doc.get("fields", {})
+            evt_id_v = fields.get("event_id", {})
+            evt_id = evt_id_v.get("stringValue") or ""
+            body_v = fields.get("review_body", {})
+            body = (body_v.get("stringValue") or "").lower()
+
+            if first_row_in_page and evt_id == cursor_event_id and scanned > 0:
+                first_row_in_page = False
+                last_event_id = evt_id
+                continue
+            first_row_in_page = False
+
+            total += 1
+            if body:
+                for i, phrases in enumerate(norm_phrases):
+                    if any(p in body for p in phrases):
+                        counts[i] += 1
+                        break  # attribute to first matching sub-issue only
+
+            last_event_id = evt_id
+
+        scanned += page_count
+        if page_count < TOPIC_COUNT_SCAN_PAGE:
+            break
+        if last_event_id == cursor_event_id:
+            # Cursor didn't advance — protect against infinite loop on duplicate event_ids.
+            break
+        cursor_event_id = last_event_id
+
+    return counts, total
 
 
 def _handle_analyze_topic(request):
@@ -2157,6 +2285,11 @@ def _handle_analyze_topic(request):
     topic = (body.get("topic") or "").strip()
     if not topic:
         return json.dumps({"error": "missing required field: topic"}), 400, JSON_HEADERS
+
+    # game/language scope the second-pass count scan against the full collection.
+    # Prefer explicit body fields; fall back to derived-from-inline-reviews if uniform.
+    scope_game = (body.get("game") or "").strip() or None
+    scope_language = (body.get("language") or "").strip() or None
 
     # Accept reviews directly from the frontend (already filtered)
     inline_reviews = body.get("reviews")
@@ -2171,12 +2304,18 @@ def _handle_analyze_topic(request):
             for r in inline_reviews
             if (r.get("review_body") or "").strip()
         ]
+        if not scope_game:
+            games = {r["game"] for r in reviews if r["game"] != "unknown"}
+            if len(games) == 1:
+                scope_game = next(iter(games))
+        if not scope_language:
+            langs = {r["language"] for r in reviews if r["language"] != "unknown"}
+            if len(langs) == 1:
+                scope_language = next(iter(langs))
     else:
         # Fallback: query Firestore directly
-        game = (body.get("game") or "").strip() or None
-        language = (body.get("language") or "").strip() or None
         try:
-            reviews = _fs_query_reviews_by_topic(topic, game, language)
+            reviews = _fs_query_reviews_by_topic(topic, scope_game, scope_language)
         except Exception as e:
             _log_event("topic_analysis_query_failed", {"topic": topic, "err": str(e)})
             return json.dumps({"error": f"Failed to query reviews: {e}"}), 500, JSON_HEADERS
@@ -2202,16 +2341,37 @@ def _handle_analyze_topic(request):
 
     now = _utc_iso_now()
 
+    # Second pass: count each sub-issue against the FULL collection so the
+    # percentages reflect real distribution, not just the 500-doc sample.
+    # If counting fails for any reason we fall through with sample-only counts.
+    sub_issues = llm_result.get("sub_issues", []) or []
+    measured_total = 0
+    if sub_issues:
+        try:
+            real_counts, measured_total = _fs_count_reviews_matching_phrases(
+                topic, scope_game, scope_language, sub_issues
+            )
+            for s, real in zip(sub_issues, real_counts):
+                s["sample_count"] = s.get("count", 0)  # keep LLM's claim for debugging
+                s["real_count"] = real
+                s["count"] = real  # FE renders s.count, so swap to the real number
+                if measured_total > 0:
+                    s["percentage"] = round(real / measured_total * 100, 1)
+            # Reorder by real count (LLM ordered by sample count which can disagree).
+            sub_issues.sort(key=lambda s: s.get("real_count", 0), reverse=True)
+        except Exception as e:
+            _log_event("topic_count_scan_failed", {"topic": topic, "err": str(e)})
+
     result = {
         "topic": topic,
         "review_count": len(reviews),
-        "total_count": total_count,
+        "total_count": measured_total or total_count,
         "summary": llm_result.get("summary", ""),
-        "sub_issues": llm_result.get("sub_issues", []),
+        "sub_issues": sub_issues,
         "generated_at": now,
     }
 
-    _log_event("topic_analysis_done", {"topic": topic, "review_count": len(reviews), "total_count": total_count, "sub_issues": len(result["sub_issues"])})
+    _log_event("topic_analysis_done", {"topic": topic, "review_count": len(reviews), "total_count": result["total_count"], "measured_total": measured_total, "sub_issues": len(result["sub_issues"])})
     return json.dumps(result, ensure_ascii=False), 200, JSON_HEADERS
 
 
