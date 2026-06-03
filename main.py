@@ -75,13 +75,15 @@ def _count_runes(s: str) -> int:
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "")
 WEBHOOK_HEADER = os.getenv("WEBHOOK_HEADER", "x-rpc-ai-review-event")
 
-VERTEX_LOCATION = os.getenv("VERTEX_LOCATION", "us-central1")
-# gemini-2.0-flash-001 was discontinued by Google on 2026-06-01 (returns 404 NOT_FOUND).
-# Migrated to gemini-2.5-flash (GA, structured output, available in us-central1). The old
-# "JSON truncation" concern with 2.5-flash was a thinking-token budget issue, not a model
-# bug — we disable thinking for these deterministic JSON calls in _gen_json, which removes it.
-VERTEX_MODEL_STAGE1 = os.getenv("VERTEX_MODEL_STAGE1", "gemini-2.5-flash")
-VERTEX_MODEL_STAGE2 = os.getenv("VERTEX_MODEL_STAGE2", "gemini-2.5-flash")
+# gemini-2.0-flash-001 was discontinued 2026-06-01 (404). Migrated to gemini-3.1-flash-lite:
+# GA, structured output, cheaper than 2.5-flash on both token axes, and (unlike 2.5-flash,
+# which has an Oct 16 2026 discontinuation cliff) no posted end-of-life — longest runway.
+# IMPORTANT: gemini-3.1-flash-lite is served on the `global` endpoint only (404 in
+# us-central1), so VERTEX_LOCATION defaults to "global". Thinking is set to MINIMAL in
+# _gen_json (the 3.x equivalent of the old thinking_budget=0) to keep JSON output un-truncated.
+VERTEX_LOCATION = os.getenv("VERTEX_LOCATION", "global")
+VERTEX_MODEL_STAGE1 = os.getenv("VERTEX_MODEL_STAGE1", "gemini-3.1-flash-lite")
+VERTEX_MODEL_STAGE2 = os.getenv("VERTEX_MODEL_STAGE2", "gemini-3.1-flash-lite")
 
 DEFAULT_TEMPLATE_LANG = os.getenv("DEFAULT_TEMPLATE_LANG", "EN")
 TEMPLATES_PATH = os.getenv("TEMPLATES_PATH", "templates.json")
@@ -485,15 +487,22 @@ def _gen_json(
 
         use_schema = response_schema if attempt == 0 else None
 
-        # Disable "thinking" for these deterministic, schema-constrained JSON calls.
-        # gemini-2.5-flash is a thinking model: with thinking on, reasoning tokens eat the
-        # max_output_tokens budget and the visible JSON answer can get truncated (the old
-        # "2.5-flash truncation bug"). Budget 0 turns it off. Built defensively so an SDK
-        # without ThinkingConfig falls back cleanly.
-        try:
-            thinking_cfg = types.ThinkingConfig(thinking_budget=0)
-        except Exception:
-            thinking_cfg = None
+        # Minimize "thinking" for these deterministic, schema-constrained JSON calls so
+        # reasoning tokens don't eat the max_output_tokens budget and truncate the JSON.
+        # Gemini 3.x replaced the 2.5-era `thinking_budget` (int) with `thinking_level`
+        # ("MINIMAL".."HIGH"); MINIMAL is the 3.x equivalent of budget 0. Try the 3.x knob
+        # first, fall back to the 2.5 budget, then to no thinking config — so this works
+        # across model generations and SDK versions without breaking.
+        thinking_cfg = None
+        for _mk in (
+            lambda: types.ThinkingConfig(thinking_level="MINIMAL"),
+            lambda: types.ThinkingConfig(thinking_budget=0),
+        ):
+            try:
+                thinking_cfg = _mk()
+                break
+            except Exception:
+                continue
 
         try:
             cfg_obj = types.GenerateContentConfig(
