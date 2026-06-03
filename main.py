@@ -3199,6 +3199,10 @@ def _build_review_events_bundle(slim: bool = False) -> bytes:
     base = f"https://firestore.googleapis.com/v1/projects/{project}/databases/{FIRESTORE_DATABASE}/documents"
     url = f"{base}:runQuery"
 
+    # The structuredQuery the FE re-runs live via onSnapshot(namedQuery). Kept
+    # WITHOUT a limit here so the named query the FE registers matches "the whole
+    # collection ordered by ingested_at desc" — pagination below is a build-time
+    # detail and must not leak into this query's definition.
     query_body = {
         "structuredQuery": {
             "from": [{"collectionId": FIRESTORE_COLLECTION}],
@@ -3209,14 +3213,35 @@ def _build_review_events_bundle(slim: bool = False) -> bytes:
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json; charset=utf-8",
     }
-    # Stream the REST response so we don't buffer ~150 MiB of JSON twice. The
-    # raw response is one giant JSON array; ijson would be ideal but the std
-    # lib parser is fine here because Firestore returns docs in chunks separated
-    # by newlines via x-goog-streaming once we pass the right Accept hint.
-    resp = _HTTP.post(url, headers=headers, data=json.dumps(query_body), timeout=300)
-    if resp.status_code != 200:
-        raise RuntimeError(f"runQuery failed http={resp.status_code} body={resp.text[:300]}")
-    items = resp.json()  # list of {document: {...}, readTime: "..."} (or {readTime} for empty matches)
+
+    # MEMORY: build the bundle PAGINATED. The old code did resp.json() on an
+    # unlimited runQuery, materializing the entire ~125k-doc collection as a Python
+    # object tree (~1+ GiB) before rendering — and that spike, x3 concurrent locks,
+    # is what OOM-killed the 4Gi instance. Here we page 5000 docs at a time, render
+    # each page's bundle elements to bytes, and drop the page's parsed objects before
+    # fetching the next. Peak memory is now ~one page + the accumulated output bytes,
+    # not the whole parsed collection. Output bytes are byte-identical to before
+    # (same element order: namedQuery, then documentMetadata+document per doc, with
+    # the leading metadata element prepended last).
+    PAGE = 5000
+
+    def _fetch_page(after_iso: Optional[str]) -> list:
+        filters = []
+        sq: Dict[str, Any] = {
+            "from": [{"collectionId": FIRESTORE_COLLECTION}],
+            "orderBy": [{"field": {"fieldPath": "ingested_at"}, "direction": "DESCENDING"}],
+            "limit": PAGE,
+        }
+        if after_iso is not None:
+            # DESCENDING cursor: next page starts strictly after the last ingested_at.
+            sq["startAt"] = {"values": [{"stringValue": after_iso}], "before": False}
+        if filters:
+            sq["where"] = {"compositeFilter": {"op": "AND", "filters": filters}}
+        page_body = {"structuredQuery": sq}
+        r = _HTTP.post(url, headers=headers, data=json.dumps(page_body), timeout=120)
+        if r.status_code != 200:
+            raise RuntimeError(f"runQuery failed http={r.status_code} body={r.text[:300]}")
+        return r.json()
 
     # Distinct bundle IDs and query names per variant. If they shared names, the
     # FE SDK's local cache would resolve namedQuery() to whichever variant was
@@ -3232,25 +3257,81 @@ def _build_review_events_bundle(slim: bool = False) -> bytes:
     bundle_parent = f"projects/{project}/databases/{FIRESTORE_DATABASE}/documents"
     create_time = _utc_iso_now()
 
-    # Pull a stable read_time from the first item that has one, falling back to
-    # the build wall-clock if every item is empty.
-    read_time: str = create_time
-    for item in items:
-        if item.get("readTime"):
-            read_time = item["readTime"]
+    # Walk the collection page by page. For each page: render documentMetadata +
+    # document elements to bytes, accumulate, then let the page's parsed objects be
+    # garbage-collected before the next fetch. read_time is taken from the first
+    # item that carries one (stable across the bundle), falling back to wall-clock.
+    body_chunks: list[bytes] = []
+    doc_count = 0
+    read_time: Optional[str] = None
+    cursor: Optional[str] = None
+
+    while True:
+        page = _fetch_page(cursor)
+        if not page:
             break
 
-    # Pre-render every document and document_metadata element so we can compute
-    # the total byte count for the leading `metadata` element. The bundle spec
-    # requires `metadata` to come FIRST and lists totalBytes / totalDocuments,
-    # but those numbers are advisory — the FE doesn't crash on a mismatch — so
-    # we set totalBytes to the sum of subsequent element bytes.
-    body_chunks: list[bytes] = []
+        if read_time is None:
+            for item in page:
+                if item.get("readTime"):
+                    read_time = item["readTime"]
+                    break
 
-    # 1) namedQuery element. The bundledQuery is the structuredQuery the FE will
-    # re-run live via onSnapshot(namedQuery(db, name)). `parent` is the resource
-    # path the structuredQuery resolves against (collection group lookups join
-    # `from[].collectionId` to this prefix).
+        last_ingested: Optional[str] = None
+        rows_in_page = 0
+        for item in page:
+            rows_in_page += 1
+            doc = item.get("document")
+            if not doc:
+                continue
+            doc_name = doc.get("name", "")
+            if not doc_name:
+                continue
+            all_fields = doc.get("fields", {})
+            # Track the ingested_at of the last doc to cursor the next page.
+            ing = all_fields.get("ingested_at", {})
+            ts_val = ing.get("stringValue") if isinstance(ing, dict) else None
+            if ts_val:
+                last_ingested = ts_val
+
+            doc_meta_el = {
+                "documentMetadata": {
+                    "name": doc_name,
+                    "readTime": item.get("readTime", read_time or create_time),
+                    "exists": True,
+                    "queries": [bundle_query_name],
+                }
+            }
+            body_chunks.append(_bundle_element(doc_meta_el))
+
+            # For the lite variant, project per-doc `fields` down to the dashboard-
+            # only whitelist; heavy fields (review_body, reply_text, rationales,
+            # aspects, key_phrases) are ~90% of bytes and dropped.
+            picked_fields = (
+                {k: v for k, v in all_fields.items() if k in _LITE_BUNDLE_FIELDS}
+                if slim else all_fields
+            )
+            doc_el = {
+                "document": {
+                    "name": doc_name,
+                    "fields": picked_fields,
+                    "createTime": doc.get("createTime"),
+                    "updateTime": doc.get("updateTime"),
+                }
+            }
+            body_chunks.append(_bundle_element(doc_el))
+            doc_count += 1
+
+        # Last page when fewer than a full page returned, or no advanceable cursor.
+        if rows_in_page < PAGE or not last_ingested or last_ingested == cursor:
+            break
+        cursor = last_ingested
+
+    if read_time is None:
+        read_time = create_time
+
+    # 1) namedQuery element — prepended before the doc elements. The bundledQuery
+    # is the unbounded structuredQuery the FE re-runs live via onSnapshot.
     named_query_el = {
         "namedQuery": {
             "name": bundle_query_name,
@@ -3261,47 +3342,7 @@ def _build_review_events_bundle(slim: bool = False) -> bytes:
             "readTime": read_time,
         }
     }
-    body_chunks.append(_bundle_element(named_query_el))
-
-    # 2) per-document elements. Skip items with no document (empty-match rows).
-    doc_count = 0
-    for item in items:
-        doc = item.get("document")
-        if not doc:
-            continue
-        doc_name = doc.get("name", "")
-        if not doc_name:
-            continue
-        doc_meta_el = {
-            "documentMetadata": {
-                "name": doc_name,
-                "readTime": item.get("readTime", read_time),
-                "exists": True,
-                "queries": [bundle_query_name],
-            }
-        }
-        body_chunks.append(_bundle_element(doc_meta_el))
-
-        # The `document` element is literally the REST runQuery doc shape.
-        # For the lite variant, project per-doc `fields` down to the dashboard-
-        # only field whitelist. Heavy fields like review_body, reply_text,
-        # stage1_rationale, stage2_aspects, stage2_key_phrases, stage2_rationale
-        # are dropped — collectively they account for ~90% of bundle bytes.
-        all_fields = doc.get("fields", {})
-        if slim:
-            picked_fields = {k: v for k, v in all_fields.items() if k in _LITE_BUNDLE_FIELDS}
-        else:
-            picked_fields = all_fields
-        doc_el = {
-            "document": {
-                "name": doc_name,
-                "fields": picked_fields,
-                "createTime": doc.get("createTime"),
-                "updateTime": doc.get("updateTime"),
-            }
-        }
-        body_chunks.append(_bundle_element(doc_el))
-        doc_count += 1
+    body_chunks.insert(0, _bundle_element(named_query_el))
 
     body_total_bytes = sum(len(c) for c in body_chunks)
 
