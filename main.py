@@ -76,9 +76,12 @@ WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "")
 WEBHOOK_HEADER = os.getenv("WEBHOOK_HEADER", "x-rpc-ai-review-event")
 
 VERTEX_LOCATION = os.getenv("VERTEX_LOCATION", "us-central1")
-# NOTE: gemini-2.5-flash has a known JSON truncation bug, using stable 2.0-flash-001 instead
-VERTEX_MODEL_STAGE1 = os.getenv("VERTEX_MODEL_STAGE1", "gemini-2.0-flash-001")
-VERTEX_MODEL_STAGE2 = os.getenv("VERTEX_MODEL_STAGE2", "gemini-2.0-flash-001")
+# gemini-2.0-flash-001 was discontinued by Google on 2026-06-01 (returns 404 NOT_FOUND).
+# Migrated to gemini-2.5-flash (GA, structured output, available in us-central1). The old
+# "JSON truncation" concern with 2.5-flash was a thinking-token budget issue, not a model
+# bug — we disable thinking for these deterministic JSON calls in _gen_json, which removes it.
+VERTEX_MODEL_STAGE1 = os.getenv("VERTEX_MODEL_STAGE1", "gemini-2.5-flash")
+VERTEX_MODEL_STAGE2 = os.getenv("VERTEX_MODEL_STAGE2", "gemini-2.5-flash")
 
 DEFAULT_TEMPLATE_LANG = os.getenv("DEFAULT_TEMPLATE_LANG", "EN")
 TEMPLATES_PATH = os.getenv("TEMPLATES_PATH", "templates.json")
@@ -482,6 +485,16 @@ def _gen_json(
 
         use_schema = response_schema if attempt == 0 else None
 
+        # Disable "thinking" for these deterministic, schema-constrained JSON calls.
+        # gemini-2.5-flash is a thinking model: with thinking on, reasoning tokens eat the
+        # max_output_tokens budget and the visible JSON answer can get truncated (the old
+        # "2.5-flash truncation bug"). Budget 0 turns it off. Built defensively so an SDK
+        # without ThinkingConfig falls back cleanly.
+        try:
+            thinking_cfg = types.ThinkingConfig(thinking_budget=0)
+        except Exception:
+            thinking_cfg = None
+
         try:
             cfg_obj = types.GenerateContentConfig(
                 temperature=temperature,
@@ -489,6 +502,7 @@ def _gen_json(
                 max_output_tokens=max_tokens,
                 response_mime_type="application/json",
                 response_schema=use_schema,
+                thinking_config=thinking_cfg,
             )
             cfg_to_use: Any = cfg_obj
         except Exception:
