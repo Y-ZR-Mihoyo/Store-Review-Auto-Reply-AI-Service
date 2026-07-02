@@ -3046,6 +3046,13 @@ def _handle_report(request):
     if game != "ALL" and game not in VALID_GAMES:
         return json.dumps({"error": f"Invalid game. Must be ALL or one of: {sorted(VALID_GAMES)}"}), 400, JSON_HEADERS
 
+    # Optional country filter (ISO 3166-1 alpha-3 territory code, e.g. "RUS").
+    # "ALL" / empty = no country scoping. Validated loosely (3 letters) so new
+    # territories work without a code-side allowlist.
+    country = (request.args.get("country") or "ALL").strip().upper()
+    if country != "ALL" and not (len(country) == 3 and country.isalpha()):
+        return json.dumps({"error": "Invalid country. Must be ALL or a 3-letter ISO alpha-3 code"}), 400, JSON_HEADERS
+
     try:
         current_start, current_end, prior_start, prior_end, label, prior_label = _compute_period_ranges(period_type, date_str)
     except Exception as e:
@@ -3069,6 +3076,11 @@ def _handle_report(request):
         current_events = [e for e in current_events if e.get("game") == game]
         prior_events = [e for e in prior_events if e.get("game") == game]
 
+    # Filter by country (territory) if not ALL
+    if country != "ALL":
+        current_events = [e for e in current_events if (e.get("territory") or "").upper() == country]
+        prior_events = [e for e in prior_events if (e.get("territory") or "").upper() == country]
+
     # Compute metrics
     metrics = _compute_report_metrics(current_events, prior_events, period_type, label, prior_label)
 
@@ -3084,6 +3096,7 @@ def _handle_report(request):
         "period_label": label,
         "prior_label": prior_label,
         "game_filter": game,
+        "country_filter": country,
         "current_range": {"start": current_start, "end": current_end},
         "prior_range": {"start": prior_start, "end": prior_end},
         "generated_at": _utc_iso_now(),
@@ -3481,6 +3494,7 @@ _DASHBOARD_EVENT_FIELDS = (
     "game",
     "game_biz",
     "language",
+    "territory",
     "ingested_at",
     "stage1_bucket",
     "stage1_confidence",
