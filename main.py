@@ -3692,13 +3692,15 @@ _RATING_LABELS = ("1 Star", "2 Stars", "3 Stars", "4 Stars", "5 Stars")
 
 
 def _swr_background_refresh(cache: Dict[str, Any], lock: threading.Lock,
-                           builder, log_name: str) -> None:
+                           builder, log_name: str, persist_doc_id: Optional[str] = None) -> None:
     """Rebuild a gzip cache entry in a background thread (stale-while-revalidate).
 
     At most one refresh runs at a time (guarded by cache["refreshing"]). On
-    success, atomically swaps in the fresh bytes; on failure, leaves the stale
-    entry in place so requests keep being served. Callers only spawn this when a
-    stale-but-present entry exists, so a build error never surfaces to a user.
+    success, atomically swaps in the fresh bytes and (if persist_doc_id given)
+    writes the blob to Firestore so cold starts can seed from it. On failure,
+    leaves the stale entry in place so requests keep being served. Callers only
+    spawn this when a stale-but-present entry exists, so a build error never
+    surfaces to a user.
     """
     import gzip as _gzip
     with lock:
@@ -3718,12 +3720,80 @@ def _swr_background_refresh(cache: Dict[str, Any], lock: threading.Lock,
                 "size_bytes": len(body), "gz_size_bytes": len(gz_body),
                 "build_ms": _now_ms() - build_start, "background": True,
             })
+            if persist_doc_id:
+                _fs_write_blob_cache(persist_doc_id, body)
         except Exception as e:
             _log_event(log_name + "_failed", {"err": str(e), "background": True})
         finally:
             cache["refreshing"] = False
 
     threading.Thread(target=_run, name=log_name + "_swr", daemon=True).start()
+
+
+# ── Firestore-persisted cache for the dashboard aggregates ────────────────────
+# In-process caches die with the instance, so the FIRST request to a freshly
+# started instance (e.g. right after a deploy) would otherwise block on the full
+# ~157k-doc scan (~20-45 s). We persist each built payload to a Firestore doc and
+# seed the in-process cache from it on cold start — a single doc GET (~100 ms)
+# instead of a collection scan. Survives cold starts and deploys.
+DASHBOARD_CACHE_COLLECTION = os.getenv("DASHBOARD_CACHE_COLLECTION", "dashboard_cache").strip()
+
+
+def _fs_read_blob_cache(doc_id: str) -> Optional[bytes]:
+    """Read a persisted payload blob (stored as a JSON string field 'data') from
+    the dashboard_cache collection. Returns UTF-8 bytes, or None if missing."""
+    if not FIRESTORE_ENABLED:
+        return None
+    try:
+        _, project = _fs_init_auth()
+        token = _fs_get_token()
+        url = _fs_doc_url(project, FIRESTORE_DATABASE, DASHBOARD_CACHE_COLLECTION, doc_id)
+        resp = _HTTP.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=FIRESTORE_WRITE_TIMEOUT_SEC)
+        if resp.status_code != 200:
+            return None
+        data_str = resp.json().get("fields", {}).get("data", {}).get("stringValue")
+        return data_str.encode("utf-8") if data_str else None
+    except Exception:
+        return None
+
+
+def _fs_write_blob_cache(doc_id: str, body: bytes) -> None:
+    """Persist a payload blob to the dashboard_cache collection (best-effort)."""
+    if not FIRESTORE_ENABLED:
+        return
+    try:
+        _, project = _fs_init_auth()
+        token = _fs_get_token()
+        url = _fs_doc_url(project, FIRESTORE_DATABASE, DASHBOARD_CACHE_COLLECTION, doc_id)
+        payload = {"fields": {
+            "data": _fs_value(body.decode("utf-8")),
+            "built_at": _fs_value(_utc_iso_now()),
+        }}
+        _HTTP.patch(url, headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8",
+        }, data=json.dumps(payload), timeout=FIRESTORE_WRITE_TIMEOUT_SEC)
+    except Exception as e:
+        _log_event("dashboard_blob_cache_write_failed", {"doc": doc_id, "err": str(e)})
+
+
+def _seed_cache_from_firestore(cache: Dict[str, Any], lock: threading.Lock, doc_id: str) -> bool:
+    """On cold start (empty in-process cache), seed from the persisted Firestore
+    blob so the first request doesn't block on a full scan. Returns True if
+    seeded. Seeded entry is marked stale (built_at=0) so the normal
+    stale-while-revalidate path refreshes it in the background."""
+    import gzip as _gzip
+    body = _fs_read_blob_cache(doc_id)
+    if not body:
+        return False
+    with lock:
+        if cache["bytes"] is not None:
+            return True  # another thread already populated it
+        cache["bytes"] = body
+        cache["gz"] = _gzip.compress(body, compresslevel=6)
+        cache["built_at"] = 0.0  # stale -> triggers background refresh
+    _log_event("dashboard_cache_seeded_from_firestore", {"doc": doc_id, "size_bytes": len(body)})
+    return True
 
 
 def _dashboard_window_start() -> str:
@@ -4001,14 +4071,20 @@ def _handle_dashboard_summary(request):
     header shape of _handle_dashboard_events.
     """
     import gzip as _gzip
-    now = time.time()
+    # Cold start: try seeding the in-process cache from the persisted Firestore
+    # blob (~100 ms) so the first request after a deploy/scale-up doesn't block
+    # on the full ~157k-doc scan. If seeded, we fall into the stale branch below
+    # and serve instantly while a background refresh runs.
     cache = _DASHBOARD_SUMMARY_CACHE
+    if cache["bytes"] is None:
+        _seed_cache_from_firestore(cache, _DASHBOARD_SUMMARY_LOCK, "dashboard_summary")
+
+    now = time.time()
     age_raw = now - cache["built_at"]
 
     if cache["bytes"] is None:
-        # Cold start on a fresh instance: nothing to serve yet, so this one
-        # request must block on the build. Every subsequent request (even after
-        # TTL lapses) is served instantly from cache — see the stale branch.
+        # No in-process cache AND no persisted blob (very first build ever, or
+        # Firestore unavailable): this one request must block on the build.
         with _DASHBOARD_SUMMARY_LOCK:
             if cache["bytes"] is None:
                 build_start = _now_ms()
@@ -4025,6 +4101,7 @@ def _handle_dashboard_summary(request):
                     "size_bytes": len(body), "gz_size_bytes": len(gz_body),
                     "build_ms": _now_ms() - build_start,
                 })
+                _fs_write_blob_cache("dashboard_summary", body)
         body = cache["bytes"]; gz_body = cache["gz"]; age = int(now - cache["built_at"])
     else:
         # Stale-while-revalidate: always serve the cached bytes immediately. If
@@ -4034,7 +4111,8 @@ def _handle_dashboard_summary(request):
         # 5-min cache boundary (previously one unlucky request ate the rebuild).
         if age_raw >= DASHBOARD_SUMMARY_TTL_SEC:
             _swr_background_refresh(cache, _DASHBOARD_SUMMARY_LOCK,
-                                    _build_dashboard_summary_payload, "dashboard_summary_built")
+                                    _build_dashboard_summary_payload, "dashboard_summary_built",
+                                    persist_doc_id="dashboard_summary")
         body = cache["bytes"]; gz_body = cache["gz"]; age = int(age_raw)
 
     accept_encoding = (request.headers.get("Accept-Encoding") or "").lower()
@@ -4137,13 +4215,15 @@ def _handle_review_action_counts(request):
     """GET /review-action-counts — cached whole-collection counts by action for
     the Reviews-DB stat cards. Same cache/gzip/header shape as /dashboard-summary."""
     import gzip as _gzip
-    now = time.time()
     cache = _REVIEW_ACTION_COUNTS_CACHE
+    if cache["bytes"] is None:
+        _seed_cache_from_firestore(cache, _REVIEW_ACTION_COUNTS_LOCK, "review_action_counts")
+
+    now = time.time()
     age_raw = now - cache["built_at"]
 
     if cache["bytes"] is None:
-        # Cold start: block this one request on the build; all later requests
-        # (incl. post-TTL) are served instantly + refreshed in the background.
+        # No in-process cache AND no persisted blob: block this one request.
         with _REVIEW_ACTION_COUNTS_LOCK:
             if cache["bytes"] is None:
                 build_start = _now_ms()
@@ -4155,13 +4235,15 @@ def _handle_review_action_counts(request):
                 gz_body = _gzip.compress(body, compresslevel=6)
                 cache["bytes"] = body; cache["gz"] = gz_body; cache["built_at"] = now
                 _log_event("review_action_counts_built", {"size_bytes": len(body), "build_ms": _now_ms() - build_start})
+                _fs_write_blob_cache("review_action_counts", body)
         body = cache["bytes"]; gz_body = cache["gz"]; age = int(now - cache["built_at"])
     else:
         # Stale-while-revalidate: serve cached bytes now; refresh in background
         # if past TTL so no request blocks on the count-aggregation round-trips.
         if age_raw >= REVIEW_ACTION_COUNTS_TTL_SEC:
             _swr_background_refresh(cache, _REVIEW_ACTION_COUNTS_LOCK,
-                                    _build_review_action_counts_payload, "review_action_counts_built")
+                                    _build_review_action_counts_payload, "review_action_counts_built",
+                                    persist_doc_id="review_action_counts")
         body = cache["bytes"]; gz_body = cache["gz"]; age = int(age_raw)
 
     accept_encoding = (request.headers.get("Accept-Encoding") or "").lower()
