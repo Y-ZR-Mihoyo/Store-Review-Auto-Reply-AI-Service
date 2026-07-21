@@ -3685,10 +3685,45 @@ DASHBOARD_SUMMARY_TTL_SEC = _env_int("DASHBOARD_SUMMARY_TTL_SEC", 300)
 # If the collection ever grows large enough that a full scan gets slow, lower
 # this env var to re-bound it (the query shape stays identical).
 DASHBOARD_WINDOW_DAYS = _env_int("DASHBOARD_WINDOW_DAYS", 3650)
-_DASHBOARD_SUMMARY_CACHE: Dict[str, Any] = {"bytes": None, "gz": None, "built_at": 0.0}
+_DASHBOARD_SUMMARY_CACHE: Dict[str, Any] = {"bytes": None, "gz": None, "built_at": 0.0, "refreshing": False}
 _DASHBOARD_SUMMARY_LOCK = threading.Lock()
 
 _RATING_LABELS = ("1 Star", "2 Stars", "3 Stars", "4 Stars", "5 Stars")
+
+
+def _swr_background_refresh(cache: Dict[str, Any], lock: threading.Lock,
+                           builder, log_name: str) -> None:
+    """Rebuild a gzip cache entry in a background thread (stale-while-revalidate).
+
+    At most one refresh runs at a time (guarded by cache["refreshing"]). On
+    success, atomically swaps in the fresh bytes; on failure, leaves the stale
+    entry in place so requests keep being served. Callers only spawn this when a
+    stale-but-present entry exists, so a build error never surfaces to a user.
+    """
+    import gzip as _gzip
+    with lock:
+        if cache.get("refreshing"):
+            return
+        cache["refreshing"] = True
+
+    def _run():
+        try:
+            build_start = _now_ms()
+            body = builder()
+            gz_body = _gzip.compress(body, compresslevel=6)
+            cache["bytes"] = body
+            cache["gz"] = gz_body
+            cache["built_at"] = time.time()
+            _log_event(log_name, {
+                "size_bytes": len(body), "gz_size_bytes": len(gz_body),
+                "build_ms": _now_ms() - build_start, "background": True,
+            })
+        except Exception as e:
+            _log_event(log_name + "_failed", {"err": str(e), "background": True})
+        finally:
+            cache["refreshing"] = False
+
+    threading.Thread(target=_run, name=log_name + "_swr", daemon=True).start()
 
 
 def _dashboard_window_start() -> str:
@@ -3968,12 +4003,14 @@ def _handle_dashboard_summary(request):
     import gzip as _gzip
     now = time.time()
     cache = _DASHBOARD_SUMMARY_CACHE
-    if cache["bytes"] is not None and (now - cache["built_at"]) < DASHBOARD_SUMMARY_TTL_SEC:
-        body = cache["bytes"]; gz_body = cache["gz"]; age = int(now - cache["built_at"])
-    else:
+    age_raw = now - cache["built_at"]
+
+    if cache["bytes"] is None:
+        # Cold start on a fresh instance: nothing to serve yet, so this one
+        # request must block on the build. Every subsequent request (even after
+        # TTL lapses) is served instantly from cache — see the stale branch.
         with _DASHBOARD_SUMMARY_LOCK:
-            now = time.time()
-            if cache["bytes"] is None or (now - cache["built_at"]) >= DASHBOARD_SUMMARY_TTL_SEC:
+            if cache["bytes"] is None:
                 build_start = _now_ms()
                 try:
                     body = _build_dashboard_summary_payload()
@@ -3988,9 +4025,17 @@ def _handle_dashboard_summary(request):
                     "size_bytes": len(body), "gz_size_bytes": len(gz_body),
                     "build_ms": _now_ms() - build_start,
                 })
-            else:
-                body = cache["bytes"]; gz_body = cache["gz"]
-        age = int(now - cache["built_at"])
+        body = cache["bytes"]; gz_body = cache["gz"]; age = int(now - cache["built_at"])
+    else:
+        # Stale-while-revalidate: always serve the cached bytes immediately. If
+        # the entry is past its TTL, kick off a single background rebuild so the
+        # NEXT request gets fresher data — but this request never blocks on the
+        # ~20s Firestore scan. This is what keeps the dashboard fast even at the
+        # 5-min cache boundary (previously one unlucky request ate the rebuild).
+        if age_raw >= DASHBOARD_SUMMARY_TTL_SEC:
+            _swr_background_refresh(cache, _DASHBOARD_SUMMARY_LOCK,
+                                    _build_dashboard_summary_payload, "dashboard_summary_built")
+        body = cache["bytes"]; gz_body = cache["gz"]; age = int(age_raw)
 
     accept_encoding = (request.headers.get("Accept-Encoding") or "").lower()
     use_gzip = "gzip" in accept_encoding and gz_body is not None
@@ -4028,7 +4073,7 @@ def _handle_dashboard_summary(request):
 # card is unchanged.
 
 REVIEW_ACTION_COUNTS_TTL_SEC = _env_int("REVIEW_ACTION_COUNTS_TTL_SEC", 300)
-_REVIEW_ACTION_COUNTS_CACHE: Dict[str, Any] = {"bytes": None, "gz": None, "built_at": 0.0}
+_REVIEW_ACTION_COUNTS_CACHE: Dict[str, Any] = {"bytes": None, "gz": None, "built_at": 0.0, "refreshing": False}
 _REVIEW_ACTION_COUNTS_LOCK = threading.Lock()
 
 
@@ -4094,12 +4139,13 @@ def _handle_review_action_counts(request):
     import gzip as _gzip
     now = time.time()
     cache = _REVIEW_ACTION_COUNTS_CACHE
-    if cache["bytes"] is not None and (now - cache["built_at"]) < REVIEW_ACTION_COUNTS_TTL_SEC:
-        body = cache["bytes"]; gz_body = cache["gz"]; age = int(now - cache["built_at"])
-    else:
+    age_raw = now - cache["built_at"]
+
+    if cache["bytes"] is None:
+        # Cold start: block this one request on the build; all later requests
+        # (incl. post-TTL) are served instantly + refreshed in the background.
         with _REVIEW_ACTION_COUNTS_LOCK:
-            now = time.time()
-            if cache["bytes"] is None or (now - cache["built_at"]) >= REVIEW_ACTION_COUNTS_TTL_SEC:
+            if cache["bytes"] is None:
                 build_start = _now_ms()
                 try:
                     body = _build_review_action_counts_payload()
@@ -4109,9 +4155,14 @@ def _handle_review_action_counts(request):
                 gz_body = _gzip.compress(body, compresslevel=6)
                 cache["bytes"] = body; cache["gz"] = gz_body; cache["built_at"] = now
                 _log_event("review_action_counts_built", {"size_bytes": len(body), "build_ms": _now_ms() - build_start})
-            else:
-                body = cache["bytes"]; gz_body = cache["gz"]
-        age = int(now - cache["built_at"])
+        body = cache["bytes"]; gz_body = cache["gz"]; age = int(now - cache["built_at"])
+    else:
+        # Stale-while-revalidate: serve cached bytes now; refresh in background
+        # if past TTL so no request blocks on the count-aggregation round-trips.
+        if age_raw >= REVIEW_ACTION_COUNTS_TTL_SEC:
+            _swr_background_refresh(cache, _REVIEW_ACTION_COUNTS_LOCK,
+                                    _build_review_action_counts_payload, "review_action_counts_built")
+        body = cache["bytes"]; gz_body = cache["gz"]; age = int(age_raw)
 
     accept_encoding = (request.headers.get("Accept-Encoding") or "").lower()
     use_gzip = "gzip" in accept_encoding and gz_body is not None
