@@ -384,31 +384,38 @@ import collections  # noqa: E402  (kept local to the limiter for clarity)
 RATE_LIMIT_ENABLED = _env_bool("RATE_LIMIT_ENABLED", True)
 _RATE_BUCKETS: Dict[str, "collections.deque"] = {}
 _RATE_LOCK = threading.Lock()
-# Number of trusted reverse-proxy hops in front of Cloud Run. Google's external
-# HTTP(S) LB APPENDS the real client IP as the rightmost XFF entry (and its own
-# after that), so the trustworthy client IP is the Nth-from-last hop. Any XFF
-# entries a caller supplies land to the LEFT and must be ignored — trusting the
-# leftmost value (the old behavior) let a caller spoof the rate-limit key and
-# brute-force /verify-pin. Default 1 = Cloud Run's single ingress LB hop.
-XFF_TRUSTED_HOPS = _env_int("XFF_TRUSTED_HOPS", 1)
-# Backstop global ceiling per bucket (across all keys) so an attacker rotating
-# the client IP can't both bypass the per-IP budget AND grow the dict unbounded.
+# Best-effort client-IP derivation for the ONE pre-auth bucket (/verify-pin).
+# Behind Google's LB + Firebase Hosting the XFF has several hops and the exact
+# client-IP position is topology-dependent, so IP keying is inherently unreliable
+# here — which is why authenticated buckets key on the SESSION TOKEN instead (see
+# _rate_key). For verify_pin we only need coarse throttling; PBKDF2 cost is the
+# real brute-force control. XFF_TRUSTED_HOPS=2 targets the standard Google ALB
+# "<client>,<lb>" shape (client = 2nd-from-last); override per environment.
+XFF_TRUSTED_HOPS = _env_int("XFF_TRUSTED_HOPS", 2)
+# Backstop: cap the bucket dict so a token/IP-rotating attacker can't grow it
+# without bound.
 _RATE_MAX_KEYS = _env_int("RATE_MAX_KEYS", 50000)
 
-# (max_requests, window_seconds) per named bucket.
+# (max_requests, window_seconds) per named bucket. Authenticated buckets are
+# keyed per SESSION TOKEN (per-user), so these are generous per-user budgets that
+# a normal user's polling never approaches — one user can never throttle another.
+# verify_pin is keyed per best-effort IP and kept generous so a realistic login
+# burst never trips (an attacker is still bounded by this + PBKDF2 cost).
 _RATE_LIMITS = {
-    "verify_pin": (10, 60),      # brute-force resistance on PIN verification
-    "analyze_topic": (30, 60),   # LLM call
-    "report": (30, 60),          # heavy Firestore scan + LLM
-    "upload": (10, 60),          # CSV upload writes
-    "data": (120, 60),           # dashboard/bundle/counts polling
+    "verify_pin": (30, 60),      # pre-auth; generous — PBKDF2 is the real control
+    "analyze_topic": (60, 60),   # per-user LLM drilldowns
+    "report": (60, 60),          # per-user report generation
+    "upload": (20, 60),          # per-user CSV uploads
+    "data": (600, 60),           # per-user dashboard/reviews-db polling headroom
 }
 
 
 def _client_ip(request) -> str:
-    """Best-effort trusted client IP. Uses the Nth-from-last X-Forwarded-For hop
-    (see XFF_TRUSTED_HOPS) which the ingress LB controls; falls back to
-    remote_addr. Never trusts the leftmost (caller-supplied) XFF entry."""
+    """Best-effort client IP for the pre-auth verify_pin bucket. Uses the
+    Nth-from-last X-Forwarded-For hop (XFF_TRUSTED_HOPS) which the ingress LB
+    controls; falls back to remote_addr. Never trusts the leftmost
+    (caller-supplied) XFF entry. Imprecision here is acceptable — verify_pin's
+    limit is deliberately generous and PBKDF2 is the real brute-force control."""
     xff = request.headers.get("X-Forwarded-For", "")
     if xff:
         parts = [p.strip() for p in xff.split(",") if p.strip()]
@@ -420,15 +427,27 @@ def _client_ip(request) -> str:
     return request.remote_addr or "unknown"
 
 
+def _rate_key(bucket: str, request) -> str:
+    """Rate-limit identity. Prefer the SESSION TOKEN (per-user, unspoofable, and
+    unaffected by the shared LB egress IP) when the caller carries one — this is
+    every authenticated bucket. Only pre-auth /verify-pin has no token, and it
+    falls back to best-effort client IP. This is what prevents the limiter from
+    collapsing all users onto one shared-infra-IP key."""
+    tok = _extract_session_token(request)
+    if tok:
+        return "tok:" + hashlib.sha256(tok.encode("utf-8")).hexdigest()[:16]
+    return "ip:" + _client_ip(request)
+
+
 def _rate_limited(bucket: str, request) -> bool:
-    """Return True if this (bucket, client) has exceeded its window budget."""
+    """Return True if this (bucket, identity) has exceeded its window budget."""
     if not RATE_LIMIT_ENABLED:
         return False
     limit = _RATE_LIMITS.get(bucket)
     if not limit:
         return False
     max_req, window = limit
-    key = f"{bucket}:{_client_ip(request)}"
+    key = f"{bucket}:{_rate_key(bucket, request)}"
     now = time.time()
     with _RATE_LOCK:
         # Bounded-memory eviction: if the dict has grown large (e.g. an IP-rotating
