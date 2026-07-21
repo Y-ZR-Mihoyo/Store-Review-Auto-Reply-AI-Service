@@ -3483,10 +3483,11 @@ _DASHBOARD_EVENTS_LOCK = threading.Lock()
 
 # Fields kept per row in the dashboard-events JSON. Each row is a flat object;
 # the FE adapter (use-intelligence-data) maps it to the existing TestCase shape.
-# review_body and stage2_key_phrases are heavier than the other fields but the
-# Analysis page genuinely needs them (sample-review snippets per topic, top
-# key-phrase frequencies). review_body is truncated server-side to keep the
-# wire payload bounded (see _DASHBOARD_REVIEW_BODY_MAX_CHARS).
+# review_body is intentionally NOT projected: at 157k rows it was ~31 MB decoded
+# of the payload, and the Analysis page now sources per-topic sample quotes lazily
+# via /analyze-topic (which fetches its own reviews from Firestore) instead of
+# from the bulk feed. stage2_key_phrases is likewise dropped — the Analysis
+# drilldown carries its own evidence phrases.
 _DASHBOARD_EVENT_FIELDS = (
     "event_id",
     "rating",
@@ -3501,18 +3502,10 @@ _DASHBOARD_EVENT_FIELDS = (
     "stage2_issue_type",
     "stage2_topic",
     "stage2_confidence",
-    "stage2_key_phrases",
     "gate_result",
     "gate_reason",
     "template_id",
-    "review_body",
 )
-
-# Hard cap on review_body length per row. The Analysis page only uses up to
-# 200 chars in its sample-review display (see use-analysis-metrics.ts L170-172
-# truncating to "...substring(0, 150) + '...'"), so 200 is plenty. Keeping the
-# cap on the server avoids shipping a few thousand-char outliers.
-_DASHBOARD_REVIEW_BODY_MAX_CHARS = 200
 
 
 def _build_dashboard_events_payload() -> bytes:
@@ -3528,9 +3521,24 @@ def _build_dashboard_events_payload() -> bytes:
     base_path = f"https://firestore.googleapis.com/v1/projects/{project}/databases/{FIRESTORE_DATABASE}/documents"
     url = f"{base_path}:runQuery"
 
+    # Bound the feed by an indexed ingested_at >= filter (DASHBOARD_WINDOW_DAYS,
+    # default 10 years) so it can never regress to the old unbounded 157k-doc
+    # scan (measured 76 s cold). The window is wider than the dataset, so it
+    # drops NO rows — the filtering pages still load the whole collection. Same
+    # window the /dashboard-summary endpoint uses.
+    window_start = _dashboard_window_start()
     query_body = {
         "structuredQuery": {
             "from": [{"collectionId": FIRESTORE_COLLECTION}],
+            # Project only the fields we ship. Without this, Firestore reads the
+            # full docs (incl. the ~31 MB of review_body + rationales) off disk
+            # just to discard them here; projecting cuts the read + parse cost.
+            "select": {"fields": [{"fieldPath": f} for f in _DASHBOARD_EVENT_FIELDS]},
+            "where": {"fieldFilter": {
+                "field": {"fieldPath": "ingested_at"},
+                "op": "GREATER_THAN_OR_EQUAL",
+                "value": {"stringValue": window_start},
+            }},
             "orderBy": [{"field": {"fieldPath": "ingested_at"}, "direction": "DESCENDING"}],
         }
     }
@@ -3562,12 +3570,7 @@ def _build_dashboard_events_payload() -> bytes:
             v = fields.get(k)
             if v is None:
                 continue
-            parsed = _fs_parse_value(v)
-            # Truncate review_body server-side to keep the JSON wire payload
-            # bounded; the Analysis page never displays more than ~200 chars.
-            if k == "review_body" and isinstance(parsed, str) and len(parsed) > _DASHBOARD_REVIEW_BODY_MAX_CHARS:
-                parsed = parsed[:_DASHBOARD_REVIEW_BODY_MAX_CHARS]
-            row[k] = parsed
+            row[k] = _fs_parse_value(v)
         rows.append(row)
 
     return json.dumps(rows, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -3636,6 +3639,492 @@ def _handle_dashboard_events(request):
 
     from flask import Response as _FlaskResponse
     resp = _FlaskResponse(_gen(), status=200)
+    for k, v in headers.items():
+        resp.headers[k] = v
+    return resp
+
+
+# -----------------------------
+# Dashboard summary: server-side pre-aggregated metrics for the Executive Dashboard
+# -----------------------------
+# The landing Dashboard (`/`, ExecutiveDashboardPage) renders ONLY aggregates
+# (KPIs, rating bars, daily/monthly trend, per-game cards, top-5 topic drivers) —
+# it never shows individual rows. Historically it downloaded the entire
+# review_events feed via /dashboard-events (~93 MB decoded) and ran ~20 client
+# aggregation passes before first paint. This endpoint computes the same numbers
+# server-side in one pass and ships tens of KB.
+#
+# Parity is load-bearing: the payload is shaped to match, field-for-field, what
+# the FE hooks (use-monitoring-metrics / use-analysis-metrics / use-ops-metrics)
+# compute so the Dashboard renders identical values whether it reads this endpoint
+# or the client-side hooks. The subtle bits:
+#   - avg_rating / low_star_pct are sent UNROUNDED (the KPI cards format them with
+#     .toFixed(3) / .toFixed(1) on a full-precision float; rounding here would
+#     corrupt the displayed decimals and the MoM deltas).
+#   - auto_reply_rate uses the FE's actionable denominator reply/(reply+tag+nh)
+#     via a faithful port of deriveAction, NOT _aggregate_events's reply/low_star.
+#   - top_topic_drivers carries per-topic game_breakdown + mom_delta because the
+#     Dashboard's topic table renders topic.gameBreakdown['GI'/'HSR'/'ZZZ'] and
+#     topic.momDelta.
+#   - events are iterated newest-first (the feed order the FE sees) so the stable
+#     sort that picks the top-5 topics breaks ties the same way the client does.
+#
+# READ-ONLY. Touches Firestore only through the same paged runQuery the /report
+# endpoint uses. Does not touch the webhook / classification / CSC-reply pipeline.
+
+DASHBOARD_SUMMARY_TTL_SEC = _env_int("DASHBOARD_SUMMARY_TTL_SEC", 300)
+# Rolling window (days) for dashboard/feed aggregation. Sole purpose is to keep
+# the Firestore query bounded by an indexed `ingested_at >=` filter so it can
+# NEVER regress to the old unbounded 157k-doc scan (measured 76 s cold). It is
+# deliberately set far wider than the dataset age (10 years) so it drops NO data
+# — the dashboard + filtering pages aggregate over the ENTIRE collection, today
+# and as it grows. (Product decision 2026-07-21: never silently clip history;
+# a 180-day window would have started dropping the oldest reviews ~2026-09-05.)
+# It is NOT floored at SERVICE_LIVE_DATE, so the ~1.1k pre-go-live CSC reviews
+# (earliest doc 2026-03-09) are included, matching the pre-change dashboard.
+# If the collection ever grows large enough that a full scan gets slow, lower
+# this env var to re-bound it (the query shape stays identical).
+DASHBOARD_WINDOW_DAYS = _env_int("DASHBOARD_WINDOW_DAYS", 3650)
+_DASHBOARD_SUMMARY_CACHE: Dict[str, Any] = {"bytes": None, "gz": None, "built_at": 0.0}
+_DASHBOARD_SUMMARY_LOCK = threading.Lock()
+
+_RATING_LABELS = ("1 Star", "2 Stars", "3 Stars", "4 Stars", "5 Stars")
+
+
+def _dashboard_window_start() -> str:
+    """Start of the aggregation window as an ISO 8601 string. With the default
+    DASHBOARD_WINDOW_DAYS (10 years) this predates the whole collection, so it
+    drops no data — it exists only to keep the Firestore query bounded by an
+    indexed `ingested_at >=` filter. NOT floored at SERVICE_LIVE_DATE, so the
+    summary matches the pre-change no-date-filter dashboard. Lexicographic
+    comparison works on full ISO strings."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    start = now - datetime.timedelta(days=DASHBOARD_WINDOW_DAYS)
+    return start.isoformat().replace("+00:00", "Z")
+
+
+def _fs_stream_events_since(window_start: str) -> List[Dict[str, Any]]:
+    """Single windowed runQuery over review_events (ingested_at >= window_start),
+    ordered ingested_at DESCENDING, parsed and filtered to real CSC events
+    (event_id prefix 'evt_gp_'). Returns newest-first.
+
+    This deliberately mirrors _build_dashboard_events_payload's single-query
+    approach — which is proven to return the whole collection correctly — rather
+    than the paged _fs_query_events_by_date_range helper. That helper has a
+    pre-existing pagination bug (it compares the post-filter page length against
+    page_limit, so a single raw page containing any non-CSC doc stops paging
+    after ~5000 rows). Using a single windowed query avoids that entirely and
+    keeps the DESC order the FE feed uses, so the Dashboard's top-5 topic
+    stable-sort tie-break matches the client. READ-ONLY.
+    """
+    _, project = _fs_init_auth()
+    token = _fs_get_token()
+    base = f"https://firestore.googleapis.com/v1/projects/{project}/databases/{FIRESTORE_DATABASE}/documents"
+    url = f"{base}:runQuery"
+    query_body = {
+        "structuredQuery": {
+            "from": [{"collectionId": FIRESTORE_COLLECTION}],
+            # Project only the fields the summary aggregates over. This is the
+            # difference between transferring/parsing 157k full docs (~40 s) and
+            # 157k 6-field docs (a few seconds). event_id is needed for the
+            # evt_gp_ CSC filter.
+            "select": {"fields": [
+                {"fieldPath": "event_id"},
+                {"fieldPath": "rating"},
+                {"fieldPath": "action"},
+                {"fieldPath": "game"},
+                {"fieldPath": "ingested_at"},
+                {"fieldPath": "stage2_topic"},
+            ]},
+            "where": {"fieldFilter": {
+                "field": {"fieldPath": "ingested_at"},
+                "op": "GREATER_THAN_OR_EQUAL",
+                "value": {"stringValue": window_start},
+            }},
+            "orderBy": [{"field": {"fieldPath": "ingested_at"}, "direction": "DESCENDING"}],
+        }
+    }
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json; charset=utf-8",
+    }
+    resp = _HTTP.post(url, headers=headers, data=json.dumps(query_body), timeout=300)
+    if resp.status_code != 200:
+        raise RuntimeError(f"runQuery failed http={resp.status_code} body={resp.text[:300]}")
+    events: List[Dict[str, Any]] = []
+    for item in resp.json():
+        doc = item.get("document")
+        if not doc:
+            continue
+        parsed = {k: _fs_parse_value(v) for k, v in doc.get("fields", {}).items()}
+        eid = parsed.get("event_id") or ""
+        if not eid.startswith("evt_gp_"):
+            continue
+        events.append(parsed)
+    return events
+
+
+def _derive_action(action: str) -> str:
+    """Faithful port of the FE deriveAction (hooks/helpers.ts). Maps the raw
+    `action` field to the display bucket using the same substring precedence so
+    server-computed counts match the client exactly (incl. the fall-through to
+    'Reply & Close' for any non-empty action that matches nothing else)."""
+    if not action:
+        return "Unprocessed"
+    if "NEEDS_HUMAN" in action:
+        return "Needs Human"
+    if "TAG_AND_CLOSE" in action or "TAG_AND_SOLVE" in action:
+        return "Tag & Close"
+    if "NOOP" in action:
+        return "NOOP"
+    return "Reply & Close"
+
+
+def _dashboard_month_label(date_key: str) -> str:
+    """Month bucket label 'MMM yyyy' from a 'YYYY-MM-DD' date key, matching the FE
+    date-fns format(..., 'MMM yyyy'). Uses the UTC date substring (same source the
+    FE daily buckets use); returns '' for unparseable keys."""
+    try:
+        return datetime.datetime.strptime(date_key, "%Y-%m-%d").strftime("%b %Y")
+    except ValueError:
+        return ""
+
+
+def _build_dashboard_summary_payload() -> bytes:
+    """Server-side aggregated metrics for the Executive Dashboard.
+
+    Streams in-window CSC events via the same paged REST runQuery the report
+    endpoint uses, then shapes only the compact aggregate set the Dashboard
+    renders. No per-row data crosses the wire — the payload is tens of KB
+    regardless of collection size.
+    """
+    window_start = _dashboard_window_start()
+    end_iso = _utc_iso_now()
+    # Newest-first (DESC), the same order the FE /dashboard-events feed uses, so
+    # the top-5 topic stable-sort tie-break matches the client exactly.
+    events = _fs_stream_events_since(window_start)
+    total = len(events)
+
+    rating_buckets = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+    sum_rating = 0
+    reply_count = 0
+    tag_count = 0
+    nh_count = 0
+    has_stage2 = 0
+
+    # Per-day / per-month / per-game / per-topic accumulators.
+    daily: Dict[str, Dict[str, int]] = {}
+    monthly: Dict[str, Dict[str, Any]] = {}
+    game_acc: Dict[str, Dict[str, int]] = {}
+    topic_acc: "Dict[str, Dict[str, Any]]" = {}
+    classified_months: Dict[str, str] = {}  # label -> sort key (YYYY-MM)
+
+    for ev in events:
+        raw = ev.get("rating")
+        # Mirror the FE `tc.starRating || 1`: falsy/missing rating counts as 1.
+        r = raw if isinstance(raw, int) and raw != 0 else 1
+        if 1 <= r <= 5:
+            rating_buckets[r] += 1
+        sum_rating += r
+        low = r <= 2
+
+        derived = _derive_action(ev.get("action") or "")
+        if derived == "Reply & Close":
+            reply_count += 1
+        elif derived == "Tag & Close":
+            tag_count += 1
+        elif derived == "Needs Human":
+            nh_count += 1
+
+        ts = ev.get("ingested_at") or ""
+        date_key = ts[:10] if len(ts) >= 10 else ""
+        mlabel = _dashboard_month_label(date_key) if date_key else ""
+        if date_key:
+            d = daily.setdefault(date_key, {"total": 0, "s1": 0, "s2": 0, "s3": 0, "s4": 0, "s5": 0, "sum": 0})
+            d["total"] += 1
+            if 1 <= r <= 5:
+                d[f"s{r}"] += 1
+            d["sum"] += r
+        if mlabel:
+            m = monthly.setdefault(mlabel, {"total": 0, "low": 0, "sum": 0, "sort": date_key[:7]})
+            m["total"] += 1
+            m["sum"] += r
+            if low:
+                m["low"] += 1
+
+        game = ev.get("game") or "Unknown"
+        g = game_acc.setdefault(game, {"total": 0, "low": 0, "sum": 0})
+        g["total"] += 1
+        g["sum"] += r
+        if low:
+            g["low"] += 1
+
+        topic = ev.get("stage2_topic") or ""
+        if topic.strip():
+            has_stage2 += 1
+            t = topic_acc.setdefault(topic, {"low": 0, "total": 0, "sum": 0, "games": {}, "months": {}})
+            t["total"] += 1
+            t["sum"] += r
+            if low:
+                t["low"] += 1
+            t["games"][game] = t["games"].get(game, 0) + 1
+            if mlabel:
+                t["months"][mlabel] = t["months"].get(mlabel, 0) + 1
+                classified_months[mlabel] = date_key[:7]
+
+    low_star_count = rating_buckets[1] + rating_buckets[2]
+    avg_rating = sum_rating / total if total else 0.0
+    low_star_pct = (low_star_count / total * 100) if total else 0.0
+    actionable = reply_count + tag_count + nh_count
+    auto_reply_rate = round(reply_count / actionable * 100, 1) if actionable else 0.0
+    stage2_coverage_pct = round(has_stage2 / total * 100, 1) if total else 0.0
+
+    rating_distribution = [
+        {"rating": _RATING_LABELS[i], "count": rating_buckets[i + 1]} for i in range(5)
+    ]
+
+    game_breakdown = sorted(
+        (
+            {
+                "game": g,
+                "total": v["total"],
+                "low_star_count": v["low"],
+                "avg_rating": round(v["sum"] / v["total"], 2) if v["total"] else 0.0,
+                "low_star_pct": round(v["low"] / v["total"] * 100, 1) if v["total"] else 0.0,
+            }
+            for g, v in game_acc.items()
+        ),
+        key=lambda x: x["total"],
+        reverse=True,
+    )
+
+    daily_data = [
+        {
+            "date": dk,
+            "total": v["total"],
+            "star1": v["s1"], "star2": v["s2"], "star3": v["s3"], "star4": v["s4"], "star5": v["s5"],
+            "avg_rating": round(v["sum"] / v["total"], 2) if v["total"] else 0.0,
+        }
+        for dk, v in sorted(daily.items())
+    ]
+
+    month_counts = [
+        {
+            "month": mk,
+            "total": v["total"],
+            "low_star_count": v["low"],
+            "avg_rating": round(v["sum"] / v["total"], 2) if v["total"] else 0.0,
+        }
+        for mk, v in sorted(monthly.items(), key=lambda kv: kv[1]["sort"])
+    ]
+
+    # Two most-recent months present among classified events, for topic MoM delta.
+    month_order = sorted(classified_months, key=lambda label: classified_months[label])
+    last_month = month_order[-1] if month_order else ""
+    prev_month = month_order[-2] if len(month_order) >= 2 else ""
+
+    total_low = sum(t["low"] for t in topic_acc.values())
+    top_topic_drivers = [
+        {
+            "rank": i + 1,
+            "topic": topic,
+            "low_star_count": v["low"],
+            "share_percent": round(v["low"] / total_low * 100, 1) if total_low else 0.0,
+            "avg_rating": round(v["sum"] / v["total"], 2) if v["total"] else 0.0,
+            "game_breakdown": v["games"],
+            "mom_delta": v["months"].get(last_month, 0) - v["months"].get(prev_month, 0),
+        }
+        for i, (topic, v) in enumerate(
+            sorted(topic_acc.items(), key=lambda kv: kv[1]["low"], reverse=True)[:5]
+        )
+    ]
+
+    payload = {
+        "total_reviews": total,
+        "low_star_count": low_star_count,
+        "low_star_pct": low_star_pct,
+        "avg_rating": avg_rating,
+        "auto_reply_rate": auto_reply_rate,
+        "stage2_coverage_pct": stage2_coverage_pct,
+        "rating_distribution": rating_distribution,
+        "game_breakdown": game_breakdown,
+        "daily_data": daily_data,
+        "month_counts": month_counts,
+        "top_topic_drivers": top_topic_drivers,
+        "meta": {"generated_at": end_iso, "window_start": window_start},
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _handle_dashboard_summary(request):
+    """GET /dashboard-summary — compact pre-aggregated metrics for the Executive
+    Dashboard. Cached in-process for DASHBOARD_SUMMARY_TTL_SEC; Cache-Control
+    propagates to the CDN so most clients hit the edge. Mirrors the cache/gzip/
+    header shape of _handle_dashboard_events.
+    """
+    import gzip as _gzip
+    now = time.time()
+    cache = _DASHBOARD_SUMMARY_CACHE
+    if cache["bytes"] is not None and (now - cache["built_at"]) < DASHBOARD_SUMMARY_TTL_SEC:
+        body = cache["bytes"]; gz_body = cache["gz"]; age = int(now - cache["built_at"])
+    else:
+        with _DASHBOARD_SUMMARY_LOCK:
+            now = time.time()
+            if cache["bytes"] is None or (now - cache["built_at"]) >= DASHBOARD_SUMMARY_TTL_SEC:
+                build_start = _now_ms()
+                try:
+                    body = _build_dashboard_summary_payload()
+                except Exception as e:
+                    _log_event("dashboard_summary_build_failed", {"err": str(e)})
+                    # 500 with JSON_HEADERS (no Cache-Control) so a transient
+                    # failure is never cached at the CDN edge.
+                    return json.dumps({"error": "build_failed", "detail": str(e)}), 500, JSON_HEADERS
+                gz_body = _gzip.compress(body, compresslevel=6)
+                cache["bytes"] = body; cache["gz"] = gz_body; cache["built_at"] = now
+                _log_event("dashboard_summary_built", {
+                    "size_bytes": len(body), "gz_size_bytes": len(gz_body),
+                    "build_ms": _now_ms() - build_start,
+                })
+            else:
+                body = cache["bytes"]; gz_body = cache["gz"]
+        age = int(now - cache["built_at"])
+
+    accept_encoding = (request.headers.get("Accept-Encoding") or "").lower()
+    use_gzip = "gzip" in accept_encoding and gz_body is not None
+    payload = gz_body if use_gzip else body
+    headers = {
+        "Content-Type": "application/json; charset=utf-8",
+        "Cache-Control": f"public, max-age={max(1, DASHBOARD_SUMMARY_TTL_SEC - age)}, s-maxage={max(1, DASHBOARD_SUMMARY_TTL_SEC - age)}",
+        "X-Cache-Age-Sec": str(age),
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": WEBHOOK_HEADER,
+        "Vary": "Accept-Encoding",
+    }
+    if use_gzip:
+        headers["Content-Encoding"] = "gzip"
+    from flask import Response as _FlaskResponse
+    resp = _FlaskResponse(payload, status=200)
+    for k, v in headers.items():
+        resp.headers[k] = v
+    return resp
+
+
+# -----------------------------
+# Review action counts: one cached response for the Reviews-DB stat cards
+# -----------------------------
+# The Reviews-DB page shows whole-collection counts by action (total, reply,
+# tag/stage1-filtered, needs-human, noop). The FE previously fired 5 parallel
+# getCountFromServer queries (~4 s each cold). This endpoint returns the same 5
+# numbers from server-side COUNT aggregations, cached + CDN-friendly, so the
+# stat cards fill from one GET. The FE keeps its 5-query path as a fallback, so
+# this is purely additive and safe to ship before/after the frontend.
+#
+# Parity note: the FE counts ALL docs in review_events (no evt_gp_ / date
+# filter — it includes sim + model-eval rows). We match that exactly here by
+# counting the whole collection, NOT the windowed CSC-only set, so the total
+# card is unchanged.
+
+REVIEW_ACTION_COUNTS_TTL_SEC = _env_int("REVIEW_ACTION_COUNTS_TTL_SEC", 300)
+_REVIEW_ACTION_COUNTS_CACHE: Dict[str, Any] = {"bytes": None, "gz": None, "built_at": 0.0}
+_REVIEW_ACTION_COUNTS_LOCK = threading.Lock()
+
+
+def _fs_count_collection(action: Optional[str]) -> int:
+    """COUNT of review_events docs (optionally filtered by action ==) via the
+    Firestore REST runAggregationQuery endpoint. Mirrors the FE's per-action
+    getCountFromServer queries. Returns -1 on failure so callers can fall back."""
+    if not FIRESTORE_ENABLED:
+        return -1
+    try:
+        _, project = _fs_init_auth()
+        token = _fs_get_token()
+        base = f"https://firestore.googleapis.com/v1/projects/{project}/databases/{FIRESTORE_DATABASE}/documents"
+        url = f"{base}:runAggregationQuery"
+        structured: Dict[str, Any] = {"from": [{"collectionId": FIRESTORE_COLLECTION}]}
+        if action:
+            structured["where"] = {"fieldFilter": {
+                "field": {"fieldPath": "action"},
+                "op": "EQUAL",
+                "value": {"stringValue": action},
+            }}
+        query_body = {"structuredAggregationQuery": {
+            "structuredQuery": structured,
+            "aggregations": [{"count": {}, "alias": "count"}],
+        }}
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"}
+        resp = _HTTP.post(url, headers=headers, data=json.dumps(query_body), timeout=30)
+        resp.raise_for_status()
+        for item in resp.json():
+            result = item.get("result") or {}
+            agg = result.get("aggregateFields") or {}
+            cnt = agg.get("count") or {}
+            if "integerValue" in cnt:
+                return int(cnt["integerValue"])
+        return -1
+    except Exception as e:
+        _log_event("review_action_count_failed", {"action": action or "all", "err": str(e)})
+        return -1
+
+
+def _build_review_action_counts_payload() -> bytes:
+    """Build the {total, replyAndClose, stage1Filtered, needsHuman, noop} payload
+    that the Reviews-DB stat cards consume — identical shape to the FE's
+    ReviewActionCounts."""
+    total = _fs_count_collection(None)
+    reply = _fs_count_collection("REPLY_AND_CLOSE")
+    tag = _fs_count_collection("TAG_AND_CLOSE")
+    nh = _fs_count_collection("NEEDS_HUMAN")
+    noop = _fs_count_collection("NOOP")
+    payload = {
+        "total": total,
+        "replyAndClose": reply,
+        "stage1Filtered": tag,
+        "needsHuman": nh,
+        "noop": noop,
+    }
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+
+def _handle_review_action_counts(request):
+    """GET /review-action-counts — cached whole-collection counts by action for
+    the Reviews-DB stat cards. Same cache/gzip/header shape as /dashboard-summary."""
+    import gzip as _gzip
+    now = time.time()
+    cache = _REVIEW_ACTION_COUNTS_CACHE
+    if cache["bytes"] is not None and (now - cache["built_at"]) < REVIEW_ACTION_COUNTS_TTL_SEC:
+        body = cache["bytes"]; gz_body = cache["gz"]; age = int(now - cache["built_at"])
+    else:
+        with _REVIEW_ACTION_COUNTS_LOCK:
+            now = time.time()
+            if cache["bytes"] is None or (now - cache["built_at"]) >= REVIEW_ACTION_COUNTS_TTL_SEC:
+                build_start = _now_ms()
+                try:
+                    body = _build_review_action_counts_payload()
+                except Exception as e:
+                    _log_event("review_action_counts_build_failed", {"err": str(e)})
+                    return json.dumps({"error": "build_failed", "detail": str(e)}), 500, JSON_HEADERS
+                gz_body = _gzip.compress(body, compresslevel=6)
+                cache["bytes"] = body; cache["gz"] = gz_body; cache["built_at"] = now
+                _log_event("review_action_counts_built", {"size_bytes": len(body), "build_ms": _now_ms() - build_start})
+            else:
+                body = cache["bytes"]; gz_body = cache["gz"]
+        age = int(now - cache["built_at"])
+
+    accept_encoding = (request.headers.get("Accept-Encoding") or "").lower()
+    use_gzip = "gzip" in accept_encoding and gz_body is not None
+    payload = gz_body if use_gzip else body
+    headers = {
+        "Content-Type": "application/json; charset=utf-8",
+        "Cache-Control": f"public, max-age={max(1, REVIEW_ACTION_COUNTS_TTL_SEC - age)}, s-maxage={max(1, REVIEW_ACTION_COUNTS_TTL_SEC - age)}",
+        "X-Cache-Age-Sec": str(age),
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": WEBHOOK_HEADER,
+        "Vary": "Accept-Encoding",
+    }
+    if use_gzip:
+        headers["Content-Encoding"] = "gzip"
+    from flask import Response as _FlaskResponse
+    resp = _FlaskResponse(payload, status=200)
     for k, v in headers.items():
         resp.headers[k] = v
     return resp
@@ -4065,6 +4554,30 @@ def review_webhook(request):
     if request.path == "/dashboard-events" and request.method == "GET":
         return _handle_dashboard_events(request)
     if request.path == "/dashboard-events" and request.method == "OPTIONS":
+        return "", 204, {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": WEBHOOK_HEADER,
+            "Access-Control-Allow-Methods": "GET, OPTIONS",
+            "Access-Control-Max-Age": "86400",
+        }
+
+    # Route: compact pre-aggregated metrics for the Executive Dashboard.
+    # Public-readable like /dashboard-events; PII-free aggregates only.
+    if request.path == "/dashboard-summary" and request.method == "GET":
+        return _handle_dashboard_summary(request)
+    if request.path == "/dashboard-summary" and request.method == "OPTIONS":
+        return "", 204, {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": WEBHOOK_HEADER,
+            "Access-Control-Allow-Methods": "GET, OPTIONS",
+            "Access-Control-Max-Age": "86400",
+        }
+
+    # Route: cached action counts for the Reviews-DB stat cards.
+    # Replaces 5 cold client getCountFromServer round-trips with one CDN-cached GET.
+    if request.path == "/review-action-counts" and request.method == "GET":
+        return _handle_review_action_counts(request)
+    if request.path == "/review-action-counts" and request.method == "OPTIONS":
         return "", 204, {
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Headers": WEBHOOK_HEADER,
