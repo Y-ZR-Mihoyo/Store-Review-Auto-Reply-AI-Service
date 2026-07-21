@@ -3822,9 +3822,12 @@ def _build_dashboard_summary_payload() -> bytes:
     for ev in events:
         raw = ev.get("rating")
         # Mirror the FE `tc.starRating || 1`: falsy/missing rating counts as 1.
-        r = raw if isinstance(raw, int) and raw != 0 else 1
-        if 1 <= r <= 5:
-            rating_buckets[r] += 1
+        # Also clamp to the valid 1-5 domain so a stray out-of-range integer
+        # (e.g. a bad doc with rating 6) can't poison sum_rating / avg_rating
+        # while being silently dropped from rating_buckets. Google Play ratings
+        # are 1-5, so this is defensive and does not change parity for real data.
+        r = raw if isinstance(raw, int) and 1 <= raw <= 5 else 1
+        rating_buckets[r] += 1
         sum_rating += r
         low = r <= 2
 
