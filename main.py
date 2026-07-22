@@ -2009,30 +2009,22 @@ def _fs_query_reviews_by_topic(
     base = f"https://firestore.googleapis.com/v1/projects/{project}/databases/{FIRESTORE_DATABASE}/documents"
     url = f"{base}:runQuery"
 
-    # Build structured query with field filters
+    # Build structured query with EQUALITY filters only. We deliberately do NOT
+    # add the event_id "evt_gp_" prefix as a Firestore RANGE filter: a range
+    # filter combined with the stage2_topic (and game/language) equality filters
+    # requires a dedicated composite index per filter combination, which isn't
+    # provisioned — Firestore returns HTTP 400 FAILED_PRECONDITION ("query
+    # requires an index"). Multiple EQUALITY filters need no composite index, so
+    # we filter by stage2_topic (+ optional game/language) here and apply the
+    # evt_gp_ prefix restriction in Python below. The topic equality already
+    # narrows the set to a few hundred docs, so client-side prefix filtering is
+    # cheap and needs no index maintenance.
     field_filters = [
         {
             "fieldFilter": {
                 "field": {"fieldPath": "stage2_topic"},
                 "op": "EQUAL",
                 "value": {"stringValue": topic},
-            }
-        },
-        # Only include real CSC webhook reviews (event_id prefix "evt_gp_")
-        # '_' is ASCII 95, '`' is ASCII 96 — so "evt_gp`" is the first string
-        # that doesn't match the "evt_gp_" prefix (lexicographic range filter).
-        {
-            "fieldFilter": {
-                "field": {"fieldPath": "event_id"},
-                "op": "GREATER_THAN_OR_EQUAL",
-                "value": {"stringValue": "evt_gp_"},
-            }
-        },
-        {
-            "fieldFilter": {
-                "field": {"fieldPath": "event_id"},
-                "op": "LESS_THAN",
-                "value": {"stringValue": "evt_gp`"},
             }
         },
     ]
@@ -2058,11 +2050,13 @@ def _fs_query_reviews_by_topic(
     else:
         where_clause = {"compositeFilter": {"op": "AND", "filters": field_filters}}
 
+    # Fetch extra headroom because we still drop non-evt_gp_ (sim/model-eval) rows
+    # client-side; without the DB-side range filter the raw result may include them.
     query_body = {
         "structuredQuery": {
             "from": [{"collectionId": FIRESTORE_COLLECTION}],
             "where": where_clause,
-            "limit": TOPIC_ANALYSIS_MAX_REVIEWS,
+            "limit": TOPIC_ANALYSIS_MAX_REVIEWS * 2,
         }
     }
 
@@ -2080,6 +2074,12 @@ def _fs_query_reviews_by_topic(
             continue
         fields = doc.get("fields", {})
         parsed = {k: _fs_parse_value(v) for k, v in fields.items()}
+        # Only include real CSC webhook reviews (event_id prefix "evt_gp_"),
+        # applied client-side (see the query-build comment above). Excludes
+        # sim-* / validate-test-* rows exactly as the old range filter did.
+        event_id = parsed.get("event_id") or ""
+        if not event_id.startswith("evt_gp_"):
+            continue
         review_body = parsed.get("review_body") or ""
         if not review_body.strip():
             continue
@@ -2089,6 +2089,8 @@ def _fs_query_reviews_by_topic(
             "rating": parsed.get("rating"),
             "game": parsed.get("game") or "unknown",
         })
+        if len(results) >= TOPIC_ANALYSIS_MAX_REVIEWS:
+            break
 
     return results
 
