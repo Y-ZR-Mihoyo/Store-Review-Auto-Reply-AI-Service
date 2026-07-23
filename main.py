@@ -5136,8 +5136,19 @@ BQ_SUB_ISSUES_TABLE = os.getenv("BQ_TARGET_TABLE", "review_sub_issues")
 
 def _sub_issue_analytics_query() -> str:
     """One query returning per-(sub_issue,topic,solvable_type) counts AND the
-    weekly per-sub_issue counts, over the ACTIONED bad-review set joined to the
-    backfilled sub_issue tags. event_id is the join key.
+    weekly per-sub_issue counts, over the ACTIONED bad-review set.
+
+    sub_issue/solvable_type come from TWO sources, COALESCEd in this precedence:
+      1. INLINE on the review doc (JSON_VALUE(data,"$.stage2_sub_issue") /
+         "$.solvable_type") — written by the LIVE pipeline for every review
+         classified since the sub_issue feature went live.
+      2. The offline BACKFILL table review_sub_issues (joined on event_id) — the
+         only source for the ~96k HISTORICAL reviews classified before the live
+         pipeline existed (the live pipeline never writes that table).
+      3. "SENTIMENT" fallback for anything neither source covers.
+    Using inline first makes the panel correct for LIVE reviews (the earlier
+    backfill-table-only query collapsed all post-deploy reviews to SENTIMENT
+    because they never join), while the table keeps full historical coverage.
 
     We compute two CTEs and UNION them with a `kind` discriminator so a single
     round-trip feeds both the Pareto and the weekly series. Weeks are Monday-
@@ -5149,9 +5160,9 @@ def _sub_issue_analytics_query() -> str:
     WITH base AS (
       SELECT
         JSON_VALUE(r.data, "$.event_id")                              AS event_id,
-        COALESCE(s.sub_issue, "SENTIMENT")                            AS sub_issue,
+        COALESCE(JSON_VALUE(r.data, "$.stage2_sub_issue"), s.sub_issue, "SENTIMENT")     AS sub_issue,
         JSON_VALUE(r.data, "$.stage2_topic")                          AS topic,
-        COALESCE(s.solvable_type, "SENTIMENT")                        AS solvable_type,
+        COALESCE(JSON_VALUE(r.data, "$.solvable_type"), s.solvable_type, "SENTIMENT")    AS solvable_type,
         DATE_TRUNC(DATE(TIMESTAMP(JSON_VALUE(r.data, "$.ingested_at"))), WEEK(MONDAY)) AS week
       FROM {raw} AS r
       LEFT JOIN {subs} AS s
@@ -5361,6 +5372,13 @@ def _handle_sub_issue_analytics(request):
                                     _build_sub_issue_analytics_payload, "sub_issue_analytics_built",
                                     persist_doc_id="sub_issue_analytics")
         body = cache["bytes"]; gz_body = cache["gz"]; age = int(age_raw)
+
+    # A Firestore-seeded cold-start entry has built_at=0.0, so `age` above would be
+    # the raw wall-clock epoch (~1.7e9), not an age. Emit -1 ("unknown / stale
+    # seed, refresh pending") in that case so downstream cache-age monitoring
+    # doesn't read garbage. Any positive value is a real age in seconds.
+    if cache["built_at"] == 0.0:
+        age = -1
 
     accept_encoding = (request.headers.get("Accept-Encoding") or "").lower()
     use_gzip = "gzip" in accept_encoding and gz_body is not None
