@@ -1,0 +1,15 @@
+# Keep the Cloud Run build context lean. The service only needs main.py,
+# templates.json, requirements.txt, Procfile, and .python-version.
+.git/
+.gitignore
+__pycache__/
+*.pyc
+.DS_Store
+.env
+debug_response.json
+
+# Local-only test assets and scripts (not part of the deployed service)
+Test Set/
+batch-run-test-set-2.py
+cloud-run-test-script.py
+validate-templates.py

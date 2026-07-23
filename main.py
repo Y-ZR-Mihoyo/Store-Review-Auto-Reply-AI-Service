@@ -545,6 +545,243 @@ TOPICS_BY_GAME: Dict[str, List[str]] = {}
 TOPIC_ISSUE_TYPE: Dict[Tuple[str, str], str] = {}
 
 
+# -----------------------------
+# Problem-level sub_issue layer (analytics drill-down)
+# -----------------------------
+# A persistent problem-level tag BENEATH stage2_topic. Where topic answers
+# "which reply template do we send", sub_issue answers "what problem does the
+# user actually have" (e.g. 充值未到账 / payment_not_credited, not just "Payment").
+# This is a checked-in constant (NOT templates.json — templates stay template-
+# keyed) so the enum is auditable and version-controlled. Keyed by the EXACT
+# canonical stage2_topic string (verified live against BigQuery 2026-07-22).
+#
+# The slots below were grounded by clustering real review key_phrases per topic
+# (see docs/routing-design.md), not invented. HSR's historical ad-hoc topics
+# ("ERROR 1001_X", "Samsung device crash") are promoted to SHARED sub_issues so
+# the Pareto is cross-game comparable. Emotion / suggestion buckets collapse to a
+# single passthrough "SENTIMENT" sub_issue (no fine split — there is no problem to
+# route, only tone).
+SUB_ISSUES_BY_TOPIC: Dict[str, List[str]] = {
+    # ── KB-answerable technical topics (fine-grained) ──
+    "Device Issues": [
+        "crash_startup", "crash_config_load", "lag_fps",
+        "overheat_battery", "black_screen", "samsung_crash",
+    ],
+    "Account issues": [
+        "login_failure", "account_lost_progress", "verification_code",
+        "account_hacked", "ban_appeal",
+    ],
+    "Big Size": ["storage_full", "install_too_long", "size_growth_per_patch"],
+    "Download Issue": [
+        "download_stuck", "download_slow", "resource_verify_loop", "update_fails",
+    ],
+    # network_error_code merged into error_code_generic: real data showed the same
+    # codes (9114, 4201) splitting across both, so they were a near-duplicate.
+    "Error Code": ["error_code_generic", "error_1001"],
+    # refund_request + double_charge merged into payment_dispute: both are billing
+    # disputes needing a human, and each was too low-volume (9 / 2 rows) to stand
+    # as its own category under re-sampling.
+    "Payment issues": ["payment_not_credited", "payment_dispute"],
+    "Voice related": ["voice_missing", "voice_quality", "dub_language"],
+    # ── HSR ad-hoc topics promoted to shared sub_issues ──
+    "ERROR 1001_X": ["error_1001"],
+    "Samsung device crash": ["samsung_crash"],
+    # ── SPECIFIC-ish long-tail living inside a GENERAL bucket ──
+    "具体问题的差评 Reasonable Low Score with specific problems": [
+        "in_game_bug", "network_connection", "texture_water_bug", "pay_to_win_mechanic",
+    ],
+    # ── Gacha variants (per-game topic strings) — mostly SENTIMENT ──
+    "Gacha/drop": ["rate_complaint", "pity_5050", "scam_feeling"],
+    "Gacha/Warp/drop": ["rate_complaint", "pity_5050", "scam_feeling"],
+    "Gacha/Signal Search/drop": ["rate_complaint", "pity_5050", "scam_feeling"],
+    # ── Ops / low-volume topics ──
+    "Know Issue": ["known_issue"],
+    "Pre-installation function": ["preinstall_issue"],
+    # ── Emotion / suggestion buckets — single passthrough, no fine split ──
+    "恶意差评 Malicious Low Score": ["SENTIMENT"],
+    "无缘由差评 Unreasonable Low Score": ["SENTIMENT"],
+    "Suggestions": ["SENTIMENT"],
+}
+
+# Passthrough sub_issue for topics with no problem to route (emotion/suggestion).
+SENTIMENT_SUB_ISSUE = "SENTIMENT"
+
+# solvable_type routing class per sub_issue. Deterministic, no LLM variance —
+# THIS is the auditable (topic, issue_type, sub_issue) -> solvable_type map the
+# plan calls for. sub_issue names are globally unique across topics (the two
+# shared ones — samsung_crash, error_1001 — resolve to the same class from every
+# topic), so keying by sub_issue alone is unambiguous; the topic-level fallback
+# below covers records where sub_issue is absent (legacy / model omission).
+#   KB_ANSWERABLE — a template/KB article resolves it (route to AI/template).
+#   SENTIMENT     — no fixable problem, only tone (route to empathy template).
+#   NEEDS_HUMAN   — identity/progress/ban/refund: a human needs the full context.
+_SOLVABLE_TYPE_BY_SUB_ISSUE: Dict[str, str] = {
+    # Device — settings / reinstall / spec guidance all have KB answers.
+    "crash_startup": "KB_ANSWERABLE",
+    "crash_config_load": "KB_ANSWERABLE",
+    "lag_fps": "KB_ANSWERABLE",
+    "overheat_battery": "KB_ANSWERABLE",
+    "black_screen": "KB_ANSWERABLE",
+    "samsung_crash": "KB_ANSWERABLE",
+    # Account — login/OTP are KB; identity theft / lost progress / bans need a human.
+    "login_failure": "KB_ANSWERABLE",
+    "verification_code": "KB_ANSWERABLE",
+    "account_lost_progress": "NEEDS_HUMAN",
+    "account_hacked": "NEEDS_HUMAN",
+    "ban_appeal": "NEEDS_HUMAN",
+    # Big Size — storage guidance / expectation setting.
+    "storage_full": "KB_ANSWERABLE",
+    "install_too_long": "KB_ANSWERABLE",
+    "size_growth_per_patch": "KB_ANSWERABLE",
+    # Download — retry / clear-cache / resource-repair steps.
+    "download_stuck": "KB_ANSWERABLE",
+    "download_slow": "KB_ANSWERABLE",
+    "resource_verify_loop": "KB_ANSWERABLE",
+    "update_fails": "KB_ANSWERABLE",
+    # Error codes (network_error_code merged into error_code_generic).
+    "error_code_generic": "KB_ANSWERABLE",
+    "error_1001": "KB_ANSWERABLE",
+    # Payment — "didn't arrive" has a KB path; disputes (refund / double-charge)
+    # need a human, folded into one payment_dispute slot.
+    "payment_not_credited": "KB_ANSWERABLE",
+    "payment_dispute": "NEEDS_HUMAN",
+    # Voice — explainable (strike context, language coverage, settings).
+    "voice_missing": "KB_ANSWERABLE",
+    "voice_quality": "KB_ANSWERABLE",
+    "dub_language": "KB_ANSWERABLE",
+    # 具体问题 — actionable tech bugs are KB; p2w is a design gripe = sentiment.
+    "in_game_bug": "KB_ANSWERABLE",
+    "network_connection": "KB_ANSWERABLE",
+    "texture_water_bug": "KB_ANSWERABLE",
+    "pay_to_win_mechanic": "SENTIMENT",
+    # Gacha — luck/rate complaints have no fix, only empathy.
+    "rate_complaint": "SENTIMENT",
+    "pity_5050": "SENTIMENT",
+    "scam_feeling": "SENTIMENT",
+    # Ops topics.
+    "known_issue": "KB_ANSWERABLE",
+    "preinstall_issue": "KB_ANSWERABLE",
+    # Emotion / suggestion passthrough.
+    "SENTIMENT": "SENTIMENT",
+}
+
+# Topic-level fallback for the solvable_type derivation, used only when a record
+# has no sub_issue (legacy rows, or the model omitted the optional field).
+_SENTIMENT_TOPICS = frozenset({
+    "恶意差评 Malicious Low Score",
+    "无缘由差评 Unreasonable Low Score",
+    "Suggestions",
+    "Gacha/drop", "Gacha/Warp/drop", "Gacha/Signal Search/drop",
+})
+_KB_ANSWERABLE_TOPICS = frozenset({
+    "Device Issues", "Account issues", "Big Size", "Download Issue",
+    "Error Code", "ERROR 1001_X", "Samsung device crash", "Payment issues",
+    "Voice related", "Know Issue", "Pre-installation function",
+    "具体问题的差评 Reasonable Low Score with specific problems",
+})
+
+
+def _sub_issues_for_topics(allowed_topics: List[str]) -> List[str]:
+    """Union (order-preserving) of the sub_issues valid for a game's allowed
+    topics, plus the SENTIMENT passthrough. This is the per-game enum handed to
+    the Stage-2 schema/prompt. Includes SENTIMENT even if no listed topic maps to
+    it, so the model always has a valid choice for emotion-only reviews."""
+    out: List[str] = []
+    seen: set = set()
+    for topic in allowed_topics:
+        for si in SUB_ISSUES_BY_TOPIC.get(topic, []):
+            if si not in seen:
+                seen.add(si)
+                out.append(si)
+    if SENTIMENT_SUB_ISSUE not in seen:
+        out.append(SENTIMENT_SUB_ISSUE)
+    return out
+
+
+def _derive_solvable_type(topic: Optional[str], issue_type: Optional[str], sub_issue: Optional[str]) -> str:
+    """Rule-based routing class for a (topic, issue_type, sub_issue) triple.
+    Deterministic — never asks the LLM. issue_type is accepted for signature
+    fidelity / future refinement but the decision is driven by sub_issue (with a
+    topic-level fallback when sub_issue is absent)."""
+    si = (sub_issue or "").strip()
+    if si and si in _SOLVABLE_TYPE_BY_SUB_ISSUE:
+        return _SOLVABLE_TYPE_BY_SUB_ISSUE[si]
+    tp = (topic or "").strip()
+    if tp in _SENTIMENT_TOPICS:
+        return "SENTIMENT"
+    if tp in _KB_ANSWERABLE_TOPICS:
+        return "KB_ANSWERABLE"
+    # Unknown topic + no sub_issue → conservative: a human should look.
+    return "NEEDS_HUMAN"
+
+
+def _sub_issue_pinned_schema(slots: List[str]) -> Dict[str, Any]:
+    enum = list(slots)
+    if SENTIMENT_SUB_ISSUE not in enum:
+        enum.append(SENTIMENT_SUB_ISSUE)
+    return {
+        "type": "OBJECT",
+        "properties": {
+            "sub_issue": {"type": "STRING", "enum": enum},
+            "confidence": {"type": "NUMBER", "minimum": 0.0, "maximum": 1.0},
+        },
+        "required": ["sub_issue"],
+        "propertyOrdering": ["sub_issue", "confidence"],
+    }
+
+
+def _sub_issue_pinned_prompt(topic: str, slots: List[str], body: str, language: str) -> str:
+    """Topic-PINNED sub_issue prompt. The topic is ALREADY decided by Stage 2;
+    this only refines it to the most specific problem slot. Because it is a
+    separate call, it can never change the Stage-2 topic (and thus never changes
+    the template/reply). Same match-on-meaning discipline as Stage 2."""
+    slots_str = ", ".join([f'"{s}"' for s in slots])
+    return f"""You are labeling a Google Play review already classified under the topic "{topic}".
+Pick the SINGLE most specific sub_issue — the concrete PROBLEM the user has — from
+this topic's slots ONLY: [{slots_str}]
+
+RULES:
+- Reviews are MULTILINGUAL. Match on MEANING/CONCEPT, not the exact English word.
+- Choose the slot whose problem the review text actually supports.
+- If the review is emotion-only, or no slot clearly matches, use "SENTIMENT".
+- Return ONLY the sub_issue; do NOT reconsider the topic.
+
+Review:
+language: {language}
+body: {_truncate(body, 800)}
+
+Return JSON: {{"sub_issue": "one slot or SENTIMENT", "confidence": 0.0-1.0}}"""
+
+
+def _derive_sub_issue_best_effort(topic: str, body: str, language: str) -> Optional[str]:
+    """Return a problem-level sub_issue for an already-chosen topic. Deterministic
+    (no LLM) for SENTIMENT-only / single-slot topics; a cheap PINNED LLM call for
+    multi-slot topics. Best-effort: any failure returns None so the reply path is
+    never affected. This is what keeps sub_issue purely additive."""
+    slots = SUB_ISSUES_BY_TOPIC.get((topic or "").strip(), [])
+    if not slots or slots == [SENTIMENT_SUB_ISSUE]:
+        return SENTIMENT_SUB_ISSUE
+    if len(slots) == 1:
+        return slots[0]
+    if not (body or "").strip():
+        return SENTIMENT_SUB_ISSUE
+    try:
+        r = _gen_json(
+            VERTEX_MODEL_STAGE2,
+            _sub_issue_pinned_prompt(topic, slots, body, language or "unknown"),
+            max_tokens=256,
+            response_schema=_sub_issue_pinned_schema(slots),
+            retries=1,
+        )
+        si = (r.get("sub_issue") or "").strip()
+        if si in slots or si == SENTIMENT_SUB_ISSUE:
+            return si
+        return SENTIMENT_SUB_ISSUE
+    except Exception as e:
+        _log_event("sub_issue_derive_failed", {"topic": topic, "err": str(e)})
+        return None
+
+
 def _load_templates(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -1105,11 +1342,48 @@ Return JSON:
 """.strip()
 
 
-def _stage2_prompt(payload: Dict[str, Any], game: str, allowed_topics: List[str], title: str, body: str) -> str:
+def _stage2_prompt(
+    payload: Dict[str, Any],
+    game: str,
+    allowed_topics: List[str],
+    title: str,
+    body: str,
+    sub_issues_by_topic: Optional[Dict[str, List[str]]] = None,
+) -> str:
     language = payload.get("language") or ""
     rating = payload.get("rating")
 
     topics_str = ", ".join([f'"{t}"' for t in allowed_topics])
+
+    # Optional, additive sub_issue guidance. Only rendered when a per-topic map is
+    # supplied — keeps the pre-sub_issue prompt byte-identical when it isn't, so
+    # topic/issue_type classification is unaffected (verified via parity check).
+    sub_issue_block = ""
+    sub_issue_json_line = ""
+    if sub_issues_by_topic:
+        catalog_lines = []
+        for t in allowed_topics:
+            slots = sub_issues_by_topic.get(t)
+            if slots:
+                slots_str = ", ".join([f'"{s}"' for s in slots])
+                catalog_lines.append(f'  - "{t}": [{slots_str}]')
+        catalog = "\n".join(catalog_lines)
+        sub_issue_block = f"""
+
+=== SUB_ISSUE (problem-level tag, additive — does NOT change topic/issue_type) ===
+AFTER you have chosen the topic, ALSO pick the single most specific sub_issue for
+that topic — the concrete PROBLEM the user has (e.g. "payment_not_credited", not
+just "Payment"). Choose from THIS topic's slots only:
+{catalog}
+Rules:
+- Match on MEANING across ALL languages, exactly as for topic (see the evidence-
+  phrase style used elsewhere: pick the slot whose phrasing the review supports).
+- Emotion-only / suggestion / pure-luck-gacha reviews have NO fixable problem →
+  use "SENTIMENT".
+- If the topic fits but no slot clearly matches, use "SENTIMENT".
+- sub_issue must NEVER override your topic or issue_type choice; it is a refinement.
+"""
+        sub_issue_json_line = '  "sub_issue": "one slot for the chosen topic, or SENTIMENT",\n'
 
     return f"""
 You are a strict classifier for Google Play review issues.
@@ -1330,7 +1604,7 @@ STEP 2: GENERAL_ISSUE topics (only if no SPECIFIC_ISSUE matches)
 | "Doesn't load past logo screen, never happened before in 2+ years" | 具体问题的差评 | used to work → software regression |
 | "bugs everywhere, fatal error mid-fight, after update" | 具体问题的差评 | in-game bugs + regression, not Error Code |
 
-Available topics: [{topics_str}]
+Available topics: [{topics_str}]{sub_issue_block}
 
 Review:
 game: {game}
@@ -1348,7 +1622,7 @@ Return JSON:
 {{
   "issue_type": "GENERAL_ISSUE or SPECIFIC_ISSUE",
   "topic": "exactly one from allowed list",
-  "confidence": 0.0-1.0,
+{sub_issue_json_line}  "confidence": 0.0-1.0,
   "rationale": "short reason, <= 20 words",
   "key_phrases": ["phrase1", "phrase2"],
   "aspects": [{{"aspect": "stability", "sentiment": "negative", "evidence": "quote"}}],
@@ -1370,8 +1644,23 @@ def _stage1_response_schema() -> Dict[str, Any]:
     }
 
 
-def _stage2_response_schema(allowed_topics: List[str]) -> Dict[str, Any]:
-    return {
+def _stage2_response_schema(
+    allowed_topics: List[str],
+    allowed_sub_issues: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    # sub_issue is OPTIONAL and additive: it does not appear in `required`, so a
+    # model that omits it still validates (back-compatible with the pre-sub_issue
+    # behavior). When allowed_sub_issues is provided we constrain it to that enum;
+    # solvable_type/stability are NOT in the schema (derived/computed downstream).
+    sub_issue_prop: Optional[Dict[str, Any]] = None
+    if allowed_sub_issues:
+        sub_issue_prop = {
+            "type": "STRING",
+            "enum": allowed_sub_issues,
+            "description": "Most specific problem-level sub_issue for the chosen topic",
+        }
+
+    schema: Dict[str, Any] = {
         "type": "OBJECT",
         "properties": {
             "issue_type": {"type": "STRING", "enum": ["SPECIFIC_ISSUE", "GENERAL_ISSUE"]},
@@ -1410,6 +1699,15 @@ def _stage2_response_schema(allowed_topics: List[str]) -> Dict[str, Any]:
         "propertyOrdering": ["issue_type", "topic", "confidence", "rationale",
                              "key_phrases", "aspects", "confidence_factors"],
     }
+
+    if sub_issue_prop is not None:
+        schema["properties"]["sub_issue"] = sub_issue_prop
+        # Insert into propertyOrdering right after "topic" — the model picks a
+        # topic, then the most specific sub_issue for it. Stays OUT of `required`.
+        ordering = schema["propertyOrdering"]
+        ordering.insert(ordering.index("topic") + 1, "sub_issue")
+
+    return schema
 
 
 # -----------------------------
@@ -1656,6 +1954,24 @@ def _firestore_write_review_event_best_effort(
             "stage2_key_phrases": stage2.get("key_phrases") if stage2.get("key_phrases") else None,
             "stage2_aspects": stage2.get("aspects") if stage2.get("aspects") else None,
             "stage2_confidence_factors": stage2.get("confidence_factors") if stage2.get("confidence_factors") else None,
+            # Problem-level layer: sub_issue (from the separate pinned call in
+            # _process_review; None on the low-confidence / legacy paths) + the
+            # rule-derived routing class. solvable_type is computed by rule (never
+            # the LLM) so it's deterministic + auditable. Prefer the value already
+            # stamped onto stage2; else derive it, but only when Stage 2 actually
+            # ran (a topic exists) — Stage-1-filtered / NOOP records leave it None
+            # rather than showing a misleading class.
+            "stage2_sub_issue": stage2.get("sub_issue"),
+            "solvable_type": (
+                stage2.get("solvable_type")
+                or (
+                    _derive_solvable_type(
+                        stage2.get("topic"), stage2.get("issue_type"), stage2.get("sub_issue")
+                    )
+                    if stage2.get("topic")
+                    else None
+                )
+            ),
             "latency_ms": latency_ms,
             "ingested_at": _utc_iso_now(),
         }
@@ -4764,6 +5080,308 @@ def _handle_review_events(request):
 
 
 # -----------------------------
+# Sub-issue analytics: problem-level Pareto + weekly burst (BigQuery-backed)
+# -----------------------------
+# Fisher (Jul 13 & 17) asked for a problem-level drill-down of the actioned
+# bad-review increment: (1) head-vs-long-tail (Pareto) and (2) long-term-stable-
+# vs-version-burst. This endpoint answers both from BigQuery — the raw Firestore-
+# export view joined to the backfilled `review_sub_issues` table (see
+# backfill_sub_issues.py). Firestore stays the live write path; BQ is the
+# analytics read path.
+#
+# ACCURACY BAR (Fisher reads the repo/BQ himself): every number here reproduces
+# from a single BQ query, the May review-bomb week is excluded from steady-state
+# baselines, and both the conservative go-live floor and the real go-live are
+# surfaced in `meta`. Nothing here is a benchmark or sample.
+SUB_ISSUE_ANALYTICS_TTL_SEC = _env_int("SUB_ISSUE_ANALYTICS_TTL_SEC", 900)  # 15 min
+_SUB_ISSUE_ANALYTICS_CACHE: Dict[str, Any] = {"bytes": None, "gz": None, "built_at": 0.0, "refreshing": False}
+_SUB_ISSUE_ANALYTICS_LOCK = threading.Lock()
+
+# Real pipeline go-live (first CSC webhook reviews landed the week of 2026-03-09).
+# SERVICE_LIVE_DATE (2026-03-27) is a CONSERVATIVE analytics floor used elsewhere;
+# we surface both so Fisher isn't tripped by the discrepancy when he checks BQ.
+SERVICE_REAL_GO_LIVE_DATE = "2026-03-10T00:00:00Z"
+
+# The May 2026 review-bomb: weeks beginning 2026-05-04/05-11/05-18 ran ~16k/37k/
+# ~20k actioned vs a ~2k/wk steady state. Excluded from the stability baseline so
+# a bomb week doesn't masquerade as a "version burst" or wreck the trailing mean.
+_BOMB_WEEK_STARTS = ("2026-05-04", "2026-05-11", "2026-05-18")
+
+# Number of top sub_issues whose weekly series we return (keeps the payload small;
+# the Pareto table still lists all of them).
+_SUB_ISSUE_WEEKLY_TOP_N = _env_int("SUB_ISSUE_WEEKLY_TOP_N", 8)
+
+_BQ_CLIENT = None
+_BQ_CLIENT_LOCK = threading.Lock()
+
+
+def _get_bq_client():
+    """Lazy BigQuery client (analytics read path). Import is local so the webhook
+    hot path never pays the import cost."""
+    global _BQ_CLIENT
+    if _BQ_CLIENT is not None:
+        return _BQ_CLIENT
+    with _BQ_CLIENT_LOCK:
+        if _BQ_CLIENT is None:
+            from google.cloud import bigquery
+            _BQ_CLIENT = bigquery.Client(project=_project_id() or None)
+    return _BQ_CLIENT
+
+
+# BQ dataset/table names (mirror backfill_sub_issues.py + the Firebase export ext).
+BQ_ANALYTICS_DATASET = os.getenv("BQ_DATASET", "review_events_analytics")
+BQ_RAW_VIEW = os.getenv("BQ_SOURCE_VIEW", "review_events_raw_latest")
+BQ_SUB_ISSUES_TABLE = os.getenv("BQ_TARGET_TABLE", "review_sub_issues")
+
+
+def _sub_issue_analytics_query() -> str:
+    """One query returning per-(sub_issue,topic,solvable_type) counts AND the
+    weekly per-sub_issue counts, over the ACTIONED bad-review set joined to the
+    backfilled sub_issue tags. event_id is the join key.
+
+    We compute two CTEs and UNION them with a `kind` discriminator so a single
+    round-trip feeds both the Pareto and the weekly series. Weeks are Monday-
+    anchored (matches the FE's date-fns weekStartsOn:1 and the report code)."""
+    project = _project_id()
+    raw = f"`{project}.{BQ_ANALYTICS_DATASET}.{BQ_RAW_VIEW}`"
+    subs = f"`{project}.{BQ_ANALYTICS_DATASET}.{BQ_SUB_ISSUES_TABLE}`"
+    return f"""
+    WITH base AS (
+      SELECT
+        JSON_VALUE(r.data, "$.event_id")                              AS event_id,
+        COALESCE(s.sub_issue, "SENTIMENT")                            AS sub_issue,
+        JSON_VALUE(r.data, "$.stage2_topic")                          AS topic,
+        COALESCE(s.solvable_type, "SENTIMENT")                        AS solvable_type,
+        DATE_TRUNC(DATE(TIMESTAMP(JSON_VALUE(r.data, "$.ingested_at"))), WEEK(MONDAY)) AS week
+      FROM {raw} AS r
+      LEFT JOIN {subs} AS s
+        ON JSON_VALUE(r.data, "$.event_id") = s.event_id
+      WHERE JSON_VALUE(r.data, "$.event_id") LIKE "evt_gp_%"
+        AND JSON_VALUE(r.data, "$.rating") IN ("1","2")
+        AND JSON_VALUE(r.data, "$.action") IN ("REPLY_AND_CLOSE","TAG_AND_CLOSE","NEEDS_HUMAN")
+        AND JSON_VALUE(r.data, "$.stage2_topic") IS NOT NULL
+        AND TIMESTAMP(JSON_VALUE(r.data, "$.ingested_at")) >= TIMESTAMP("{SERVICE_REAL_GO_LIVE_DATE}")
+    )
+    SELECT "pareto" AS kind, sub_issue, topic, solvable_type,
+           CAST(NULL AS DATE) AS week, COUNT(*) AS n
+    FROM base
+    GROUP BY sub_issue, topic, solvable_type
+    UNION ALL
+    SELECT "weekly" AS kind, sub_issue, CAST(NULL AS STRING) AS topic,
+           CAST(NULL AS STRING) AS solvable_type, week, COUNT(*) AS n
+    FROM base
+    GROUP BY sub_issue, week
+    """
+
+
+def _compute_stability(weekly_counts: Dict[str, int], all_weeks: List[str]) -> str:
+    """Classify a sub_issue's time-series as VERSION_BURST / LONG_TERM_STABLE /
+    MIXED, from the weekly counts (bomb weeks already excluded by the caller).
+
+    VERSION_BURST — some week spikes to > mean + N*std of the OTHER weeks AND it
+                    decays afterward (a transient patch-driven spike).
+    LONG_TERM_STABLE — present across most weeks without such a spike.
+    MIXED — too few active weeks to call it (sparse / just-emerged).
+    """
+    series = [int(weekly_counts.get(w, 0)) for w in all_weeks]
+    active = [c for c in series if c > 0]
+    if len(active) < 3:
+        return "MIXED"  # not enough signal to classify
+
+    peak = max(series)
+    peak_idx = series.index(peak)
+    others = series[:peak_idx] + series[peak_idx + 1:]
+    mean_others = sum(others) / len(others) if others else 0.0
+    var = sum((c - mean_others) ** 2 for c in others) / len(others) if others else 0.0
+    std = math.sqrt(var)
+
+    # Spike test: peak clearly exceeds the rest (Nσ, with an absolute floor so a
+    # flat-but-small series doesn't trip on noise).
+    threshold = mean_others + 2.5 * std
+    is_spike = peak >= max(threshold, mean_others * 2.0, mean_others + 5)
+
+    # Decay test: the weeks AFTER the peak fall back toward baseline.
+    after = series[peak_idx + 1:]
+    decays = bool(after) and (sum(after) / len(after) <= mean_others * 1.5 + 1)
+
+    if is_spike and decays and peak_idx < len(series) - 1:
+        return "VERSION_BURST"
+    # Persistent presence with no dominating transient spike.
+    weeks_active_ratio = len(active) / len(all_weeks) if all_weeks else 0.0
+    if weeks_active_ratio >= 0.5 and not is_spike:
+        return "LONG_TERM_STABLE"
+    if is_spike and not decays:
+        # Spiked and stayed elevated — a level shift, not a transient burst.
+        return "LONG_TERM_STABLE"
+    return "MIXED"
+
+
+def _build_sub_issue_analytics_payload() -> bytes:
+    """Run the BQ query and shape the {pareto, weekly, meta} payload. Stability is
+    computed here from the weekly series (bomb weeks excluded), never guessed per
+    review by the LLM."""
+    client = _get_bq_client()
+    rows = list(client.query(_sub_issue_analytics_query()).result())
+
+    # --- split the unioned result ---
+    pareto_rows: List[Dict[str, Any]] = []
+    weekly_map: Dict[str, Dict[str, int]] = {}  # sub_issue -> {week -> count}
+    weeks_set: set = set()
+    total = 0
+    for r in rows:
+        if r["kind"] == "pareto":
+            cnt = int(r["n"])
+            total += cnt
+            pareto_rows.append({
+                "sub_issue": r["sub_issue"],
+                "topic": r["topic"],
+                "solvable_type": r["solvable_type"],
+                "count": cnt,
+            })
+        else:  # weekly
+            wk = r["week"].isoformat() if r["week"] else None
+            if not wk:
+                continue
+            weeks_set.add(wk)
+            weekly_map.setdefault(r["sub_issue"], {})[wk] = int(r["n"])
+
+    # Aggregate the pareto rows to sub_issue level for share/cumulative (a
+    # sub_issue can appear under >1 topic — e.g. the shared samsung_crash/error
+    # slots — so sum across topics but keep the dominant topic for display).
+    by_sub: Dict[str, Dict[str, Any]] = {}
+    for pr in pareto_rows:
+        si = pr["sub_issue"]
+        e = by_sub.setdefault(si, {
+            "sub_issue": si, "count": 0, "solvable_type": pr["solvable_type"],
+            "_topics": {},
+        })
+        e["count"] += pr["count"]
+        e["_topics"][pr["topic"]] = e["_topics"].get(pr["topic"], 0) + pr["count"]
+
+    # Steady-state weeks = all weeks except the excluded May bomb weeks.
+    all_weeks = sorted(weeks_set)
+    steady_weeks = [w for w in all_weeks if w not in _BOMB_WEEK_STARTS]
+
+    # Leakage disclosure (reproducible from the same rows): reviews with the
+    # passthrough SENTIMENT sub_issue that nonetheless sit under an ANSWERABLE
+    # topic. These carry a genuinely-routable problem (account recovery, redeem-
+    # not-credited, can't-install) but were force-collapsed to SENTIMENT. Surfaced
+    # so the "answerable share" is honestly bounded rather than silently understated.
+    sentiment_leakage_reviews = sum(
+        pr["count"] for pr in pareto_rows
+        if pr["sub_issue"] == SENTIMENT_SUB_ISSUE and (pr["topic"] or "") not in _SENTIMENT_TOPICS
+    )
+
+    pareto = sorted(by_sub.values(), key=lambda x: x["count"], reverse=True)
+    cumulative = 0
+    denom = total or 1
+    for e in pareto:
+        # Dominant topic for the row label.
+        e["topic"] = max(e["_topics"].items(), key=lambda kv: kv[1])[0] if e["_topics"] else None
+        del e["_topics"]
+        e["share"] = round(e["count"] / denom * 100, 2)
+        cumulative += e["count"]
+        e["cumulative"] = round(cumulative / denom * 100, 2)
+        # Stability from the steady-state weekly series (bomb weeks removed).
+        e["stability"] = _compute_stability(weekly_map.get(e["sub_issue"], {}), steady_weeks)
+
+    # Weekly series for the top-N sub_issues (full week axis, incl. bomb weeks so
+    # the chart shows the spike; the FE annotates the excluded weeks).
+    top_subs = [e["sub_issue"] for e in pareto[:_SUB_ISSUE_WEEKLY_TOP_N]]
+    weekly: List[Dict[str, Any]] = []
+    for si in top_subs:
+        wc = weekly_map.get(si, {})
+        for wk in all_weeks:
+            if wk in wc:
+                weekly.append({"week": wk, "sub_issue": si, "count": wc[wk]})
+
+    payload = {
+        "pareto": pareto,
+        "weekly": weekly,
+        "meta": {
+            "total": total,
+            "window_start": SERVICE_REAL_GO_LIVE_DATE,
+            "service_live_date_conservative": SERVICE_LIVE_DATE,
+            "real_go_live_date": SERVICE_REAL_GO_LIVE_DATE,
+            "go_live_note": (
+                "Analytics floored at the real pipeline go-live (2026-03-10). "
+                "The codebase constant SERVICE_LIVE_DATE (2026-03-27) is a more "
+                "conservative floor used by other endpoints; both surfaced here."
+            ),
+            "excluded_bomb_weeks": list(_BOMB_WEEK_STARTS),
+            "bomb_week_note": (
+                "May 2026 review-bomb weeks are excluded from the stability "
+                "baseline (they ran ~10-24x steady state); they still appear in the "
+                "weekly chart so the spike is visible."
+            ),
+            "weekly_top_n": _SUB_ISSUE_WEEKLY_TOP_N,
+            "weeks": all_weeks,
+            "steady_weeks": steady_weeks,
+            # Honest bound on the answerable share: reviews with a routable topic
+            # that were force-collapsed to the SENTIMENT passthrough (see above).
+            "sentiment_leakage_reviews": sentiment_leakage_reviews,
+            "source": "live_bigquery",
+            "generated_at": _utc_iso_now(),
+        },
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _handle_sub_issue_analytics(request):
+    """GET /sub-issue-analytics — problem-level Pareto + weekly burst from BQ.
+    Session-gated (PII-free aggregates), cached like /dashboard-summary."""
+    import gzip as _gzip
+    cache = _SUB_ISSUE_ANALYTICS_CACHE
+    if cache["bytes"] is None:
+        _seed_cache_from_firestore(cache, _SUB_ISSUE_ANALYTICS_LOCK, "sub_issue_analytics")
+
+    now = time.time()
+    age_raw = now - cache["built_at"]
+
+    if cache["bytes"] is None:
+        with _SUB_ISSUE_ANALYTICS_LOCK:
+            if cache["bytes"] is None:
+                build_start = _now_ms()
+                try:
+                    body = _build_sub_issue_analytics_payload()
+                except Exception as e:
+                    _log_event("sub_issue_analytics_build_failed", {"err": str(e)})
+                    return json.dumps({"error": "build_failed", "detail": str(e)}), 500, JSON_HEADERS
+                gz_body = _gzip.compress(body, compresslevel=6)
+                cache["bytes"] = body; cache["gz"] = gz_body; cache["built_at"] = now
+                _log_event("sub_issue_analytics_built", {
+                    "size_bytes": len(body), "gz_size_bytes": len(gz_body),
+                    "build_ms": _now_ms() - build_start,
+                })
+                _fs_write_blob_cache("sub_issue_analytics", body)
+        body = cache["bytes"]; gz_body = cache["gz"]; age = int(now - cache["built_at"])
+    else:
+        if age_raw >= SUB_ISSUE_ANALYTICS_TTL_SEC:
+            _swr_background_refresh(cache, _SUB_ISSUE_ANALYTICS_LOCK,
+                                    _build_sub_issue_analytics_payload, "sub_issue_analytics_built",
+                                    persist_doc_id="sub_issue_analytics")
+        body = cache["bytes"]; gz_body = cache["gz"]; age = int(age_raw)
+
+    accept_encoding = (request.headers.get("Accept-Encoding") or "").lower()
+    use_gzip = "gzip" in accept_encoding and gz_body is not None
+    payload = gz_body if use_gzip else body
+    headers = {
+        "Content-Type": "application/json; charset=utf-8",
+        "Cache-Control": _data_cache_control(SUB_ISSUE_ANALYTICS_TTL_SEC, age),
+        "X-Cache-Age-Sec": str(age),
+        **_gated_cors_headers(request),
+        **SECURITY_HEADERS,
+    }
+    if use_gzip:
+        headers["Content-Encoding"] = "gzip"
+    from flask import Response as _FlaskResponse
+    resp = _FlaskResponse(payload, status=200)
+    for k, v in headers.items():
+        resp.headers[k] = v
+    return resp
+
+
+# -----------------------------
 # Async helpers
 # -----------------------------
 def _enqueue_review_task(event_id: str, payload: Dict[str, Any]) -> bool:
@@ -4986,6 +5604,13 @@ def _process_review(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
         _firestore_write_review_event_best_effort(event_id=event_id, payload=payload, result=result, latency_ms=latency)
         return result, False
 
+    # Stage 2 topic/issue_type classification. This uses the ORIGINAL prompt +
+    # schema (no sub_issue) so it is byte-identical to the pre-sub_issue pipeline
+    # — the chosen topic (and therefore the template/reply) is provably unchanged.
+    # sub_issue is derived AFTER, by a separate topic-pinned call (see below), so
+    # the problem-level layer can never shift the reply. (An earlier single-call
+    # design let the extra prompt text nudge a borderline crash/freeze review from
+    # Account issues -> Device Issues; splitting the calls removes that risk.)
     stage2_prompt = _stage2_prompt(payload, game, allowed_topics, title, body)
     stage2_schema = _stage2_response_schema(allowed_topics)
 
@@ -5024,6 +5649,16 @@ def _process_review(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
 
     issue_type = (stage2.get("issue_type") or "").strip()
     topic = (stage2.get("topic") or "").strip()
+
+    # Problem-level layer (additive, non-blocking): derive sub_issue from the
+    # ALREADY-decided topic via a separate pinned call, then stamp it + the
+    # rule-derived solvable_type onto the stage2 dict so they persist. This runs
+    # only for a confidently-classified topic and never affects the reply path —
+    # a failure just leaves sub_issue null. (Deterministic for SENTIMENT-only /
+    # single-slot topics, so most reviews add no extra LLM call.)
+    sub_issue = _derive_sub_issue_best_effort(topic, body, lang_code)
+    stage2["sub_issue"] = sub_issue
+    stage2["solvable_type"] = _derive_solvable_type(topic, issue_type, sub_issue)
 
     lang_key, lang_fallback = _lang_to_template_key(lang_code)
     tpl, tpl_lang_fallback = _select_template(game, issue_type, topic, lang_key)
@@ -5256,10 +5891,13 @@ def review_webhook(request):
     # /review-events is NEW — no deployed client calls it yet, and it returns
     # review_body (PII) — so it is gated in BOTH modes, not just strict.
     _DATA_PATHS = ("/review-bundle", "/review-bundle/lite", "/dashboard-events",
-                   "/dashboard-summary", "/review-action-counts", "/review-events")
-    # /review-events is new — no compat client calls it — so it requires a real
-    # SESSION token even in compat (never the burned legacy token).
-    _SESSION_ONLY_DATA = ("/review-events",)
+                   "/dashboard-summary", "/review-action-counts", "/review-events",
+                   "/sub-issue-analytics")
+    # /review-events and /sub-issue-analytics are new — no compat client calls
+    # them — so they require a real SESSION token even in compat (never the
+    # burned legacy token). /sub-issue-analytics is PII-free aggregates, but
+    # gating it fully is free (no deployed client to break) and cleaner.
+    _SESSION_ONLY_DATA = ("/review-events", "/sub-issue-analytics")
     if request.path in _DATA_PATHS:
         if request.method == "OPTIONS":
             return "", 204, {**_gated_cors_headers(request), **SECURITY_HEADERS}
@@ -5298,6 +5936,10 @@ def review_webhook(request):
     # FE's direct Firestore SDK reads once deny-all rules land).
     if request.path == "/review-events" and request.method == "GET":
         return _handle_review_events(request)
+
+    # Route: problem-level (sub_issue) Pareto + weekly-burst analytics from BQ.
+    if request.path == "/sub-issue-analytics" and request.method == "GET":
+        return _handle_sub_issue_analytics(request)
 
     # Route: on-demand topic sub-issue analysis
     if request.path == "/analyze-topic" and request.method == "POST":
